@@ -68,11 +68,31 @@ impl Canvas {
         self.widgets.remove(&id);
     }
 
-    /// Закрепить окно на экране по его текущему прямоугольнику. `widget` — исключить из навигации.
-    pub fn pin(&mut self, id: WindowId, screen: ScreenRect, widget: bool) {
+    /// Закрепить окно на экране (не двигается камерой, вне навигации).
+    pub fn pin(&mut self, id: WindowId, screen: ScreenRect) {
         self.pinned.insert(id, screen);
-        if widget {
+    }
+
+    /// Виджет: остаётся на холсте, но не участвует в навигации (focus-nearest, MRU).
+    pub fn set_widget(&mut self, id: WindowId, on: bool) {
+        if on {
             self.widgets.insert(id);
+        } else {
+            self.widgets.remove(&id);
+        }
+    }
+
+    /// Поставить окно в точку мира (центр окна).
+    pub fn set_world_center(&mut self, id: WindowId, c: Vec2) {
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.0 = c;
+        }
+    }
+
+    /// Открепить: окно остаётся там, где стоит на экране, и дальше живёт на холсте.
+    pub fn unpin(&mut self, id: WindowId) {
+        if let Some(r) = self.pinned.remove(&id) {
+            self.adopt(id, r);
         }
     }
 
@@ -211,11 +231,29 @@ mod tests {
     fn pinned_window_ignores_camera() {
         let mut c = Canvas::new((0, 0), (1920, 1080));
         c.adopt(WindowId(1), r(100, 200));
-        c.pin(WindowId(1), r(100, 200), true);
+        c.pin(WindowId(1), r(100, 200));
         c.pan_px(500.0, 500.0);
         assert_eq!(c.screen_rect(WindowId(1)), Some(r(100, 200)));
+        assert_eq!(c.navigable().count(), 0);
+        // открепление оставляет окно на месте экрана и возвращает его холсту
+        c.unpin(WindowId(1));
+        assert_eq!(c.screen_rect(WindowId(1)), Some(r(100, 200)));
+        c.pan_px(100.0, 0.0);
+        assert_eq!(c.screen_rect(WindowId(1)).unwrap().x, 0);
+        assert_eq!(c.navigable().count(), 1);
+    }
+
+    #[test]
+    fn widget_moves_with_camera_but_is_not_navigable() {
+        let mut c = Canvas::new((0, 0), (1920, 1080));
+        c.adopt(WindowId(1), r(100, 200));
+        c.set_widget(WindowId(1), true);
+        c.pan_px(100.0, 0.0);
+        assert_eq!(c.screen_rect(WindowId(1)).unwrap().x, 0);
         assert!(c.is_widget(WindowId(1)));
         assert_eq!(c.navigable().count(), 0);
+        c.set_world_center(WindowId(1), Vec2::new(0.0, 0.0));
+        assert_eq!(c.window_center(WindowId(1)), Some(Vec2::new(0.0, 0.0)));
     }
 
     #[test]
@@ -226,7 +264,7 @@ mod tests {
         c.adopt(WindowId(3), r(2400, 400)); // справа дальше
         c.adopt(WindowId(4), r(800, 1000)); // ниже на экране
         c.adopt(WindowId(5), r(1100, 400)); // справа, ближе всех, но закреплено
-        c.pin(WindowId(5), r(1100, 400), false);
+        c.pin(WindowId(5), r(1100, 400));
         let from = c.window_center(WindowId(1)).unwrap();
         assert_eq!(
             c.nearest(from, Some(WindowId(1)), Dir::Right),

@@ -35,6 +35,7 @@ pub struct Managed {
     pub id: WindowId,
     pub pid: u32,
     pub exe: String,
+    pub class: String,
     pub title: String,
     pub border: Border,
     pub visible: ScreenRect,
@@ -51,6 +52,10 @@ pub struct Skipped {
 pub struct Filter {
     /// Белый список имён exe (в нижнем регистре). `None` = все окна (только по явному `--all`).
     pub only: Option<Vec<String>>,
+    /// Имена exe (нижний регистр), которые не трогаем.
+    pub exclude_exe: Vec<String>,
+    /// Классы окон, которые не трогаем (без учёта регистра).
+    pub exclude_class: Vec<String>,
 }
 
 const EXCLUDE_EXE: &[&str] = &["taskmgr.exe"];
@@ -183,7 +188,14 @@ unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> windows::core::BOOL {
         if cloaked != 0 {
             return true.into();
         }
-        if EXCLUDE_CLASS.contains(&class_of(h).as_str()) {
+        let class = class_of(h);
+        if EXCLUDE_CLASS.contains(&class.as_str())
+            || ctx
+                .filter
+                .exclude_class
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&class))
+        {
             return true.into();
         }
         let mut pid = 0u32;
@@ -203,7 +215,7 @@ unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> windows::core::BOOL {
                 reason,
             })
         };
-        if EXCLUDE_EXE.contains(&lexe.as_str()) {
+        if EXCLUDE_EXE.contains(&lexe.as_str()) || ctx.filter.exclude_exe.contains(&lexe) {
             return true.into();
         }
         if elevated != Some(false) {
@@ -221,6 +233,7 @@ unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> windows::core::BOOL {
             id: WindowId(h.0 as usize as u64),
             pid,
             exe,
+            class,
             title,
             border,
             visible,
@@ -262,6 +275,34 @@ pub fn current_visible(m: &Managed) -> Option<ScreenRect> {
 pub fn is_minimized_or_maximized(m: &Managed) -> bool {
     let h = hwnd_of(m.id);
     unsafe { IsIconic(h).as_bool() || IsZoomed(h).as_bool() }
+}
+
+/// Попросить окно закрыться (как крестик в заголовке).
+pub fn close(m: &Managed) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd_of(m.id)),
+            WM_CLOSE,
+            Default::default(),
+            Default::default(),
+        );
+    }
+}
+
+/// Изменить размер окна так, чтобы видимый кадр стал `w`x`h` (положение не меняется).
+pub fn resize_visible(m: &Managed, w: i32, h: i32) {
+    let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd_of(m.id),
+            None,
+            0,
+            0,
+            w + m.border.l + m.border.r,
+            h + m.border.t + m.border.b,
+            flags,
+        );
+    }
 }
 
 /// Окно, которое сейчас в фокусе.
@@ -371,6 +412,9 @@ pub struct BaselineEntry {
     /// Оконный прямоугольник (GetWindowRect) до управления.
     pub left: i32,
     pub top: i32,
+    /// Исходный внешний размер окна, если правило его изменило (чтобы вернуть при выходе).
+    #[serde(default)]
+    pub resized_from: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -387,6 +431,14 @@ impl Baseline {
             exe: m.exe.clone(),
             left: home_visible.x - m.border.l,
             top: home_visible.y - m.border.t,
+            resized_from: None,
+        }
+    }
+
+    /// Запомнить исходный размер окна, изменённого правилом.
+    pub fn set_original_size(&mut self, id: u64, pid: u32, w: i32, h: i32) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id && e.pid == pid) {
+            e.resized_from.get_or_insert((w, h));
         }
     }
 
@@ -418,7 +470,20 @@ impl Baseline {
                 if pid != e.pid {
                     continue;
                 }
-                if SetWindowPos(h, None, e.left, e.top, 0, 0, flags).is_ok() {
+                let ok = match e.resized_from {
+                    Some((w, hh)) => SetWindowPos(
+                        h,
+                        None,
+                        e.left,
+                        e.top,
+                        w,
+                        hh,
+                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+                    ),
+                    None => SetWindowPos(h, None, e.left, e.top, 0, 0, flags),
+                }
+                .is_ok();
+                if ok {
                     n += 1;
                 }
             }

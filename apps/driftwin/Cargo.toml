@@ -9,6 +9,7 @@ license.workspace = true
 dw-core.workspace = true
 dw-win.workspace = true
 dw-input.workspace = true
+dw-config.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

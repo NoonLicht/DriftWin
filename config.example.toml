@@ -1,0 +1,38 @@
+# Пример конфигурации DriftWin. Положите как %APPDATA%\DriftWin\config.toml или укажите --config.
+# Проверка без запуска: driftwin --check-config [--config путь]. Изменения подхватываются на лету.
+
+mod_key = "super"            # super | alt  (ctrl не поддерживается)
+
+[windows]
+only = []                    # белый список exe; вместо --only (безопасный режим требует список или --all)
+exclude = [ { exe = "Taskmgr.exe" }, { class = "Shell_TrayWnd" } ]
+max_fps = 60
+panic_key = "mod+ctrl+shift+r"
+
+[navigation]
+pan_step = 100.0             # шаг клавиш-стрелок, px
+camera_speed = 0.3           # доля пути, проходимая камерой за кадр (0.01..1)
+mouse_speed = 1.0            # множитель перетаскивания холста мышью
+auto_navigate = true         # при смене фокуса на окно вне экрана камера подходит к нему
+
+[navigation.bookmarks]
+"1" = [0, 0]
+
+[bindings]
+disable_defaults = []        # "keys", "mouse" — отключить стандартные привязки
+
+[keybindings]
+# "комбинация" = "действие"; "none" отключает стандартную привязку
+"mod+ctrl+right" = "pan-viewport right"
+"mod+ctrl+q" = "quit"
+"mod+ctrl+h" = "none"
+
+[mouse.anywhere]
+"mod+ctrl+left" = "pan-viewport"
+
+[[window_rules]]
+app_id = "notepad.exe"       # exe без учёта регистра; можно class = "...", title = "*glob*" или "/regex/"
+size = [900, 600]            # видимый кадр
+# widget = true              # остаётся на холсте, вне навигации/MRU
+# pinned_to_screen = true    # закреплено на экране (position — от центра монитора, Y вверх)
+# position = [0, 0]

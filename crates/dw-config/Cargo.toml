@@ -6,3 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dw-core.workspace = true
+serde.workspace = true
+toml = "0.9"
+serde_ignored = "0.1"
+regex = "1"

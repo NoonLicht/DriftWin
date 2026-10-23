@@ -1,27 +1,23 @@
 //! Глобальные хуки клавиатуры и мыши (WH_KEYBOARD_LL, WH_MOUSE_LL) в отдельном потоке.
 //! Хуки только ставят событие в очередь; аварийная клавиша обрабатывается прямо на потоке хука.
 //!
-//! Привязки (Mod = Win):
-//! - Mod+Ctrl+стрелки — сдвиг камеры; Mod+Ctrl+ЛКМ-перетаскивание — панорама с инерцией
-//! - Mod+Alt+стрелки — фокус на ближайшее окно в направлении
-//! - Mod+Ctrl+Tab / +Shift — переключатель по MRU вперёд/назад
-//! - Mod+Ctrl+C — центрировать на окне в фокусе; Mod+Ctrl+H — домой
-//! - Mod+Ctrl+1..9 — перейти к закладке; Mod+Ctrl+Shift+1..9 — запомнить закладку
-//! - Mod+Ctrl+Shift+R — аварийный возврат окон
+//! Привязки приходят из конфига (`dw-config`) в виде `Bindings` и подменяются на лету
+//! через `set_bindings`; хук только сопоставляет клавишу с таблицей и ставит событие в очередь.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::SeqCst};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::SeqCst};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crossbeam_channel::Sender;
 pub use dw_core::Dir;
+use dw_core::action::{Action, Bindings, Mods};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
-    Pan(Dir),
-    /// Mod+Ctrl+Shift+R. К моменту отправки колбэк паники уже вызван.
+    Action(Action),
+    /// Аварийная клавиша. К моменту отправки колбэк паники уже вызван.
     Panic,
     /// Смещение курсора при перетаскивании холста, пиксели экрана.
     Drag {
@@ -29,13 +25,6 @@ pub enum Input {
         dy: i32,
     },
     DragEnd,
-    Focus(Dir),
-    /// `true` — вперёд по списку MRU.
-    Cycle(bool),
-    Center,
-    Home,
-    BookmarkGo(u8),
-    BookmarkSet(u8),
 }
 
 const MAGIC: usize = 0xD21F7;
@@ -56,6 +45,53 @@ static SWALLOWED: AtomicBool = AtomicBool::new(false);
 /// воспримет это как одиночное нажатие Alt и покажет подсказки меню.
 static ALT_SWALLOWED: AtomicBool = AtomicBool::new(false);
 
+/// Клавиша последней перехваченной комбинации: её отпускание тоже глотаем, даже если модификаторы уже сняты.
+static LAST_SWALLOWED_VK: AtomicU32 = AtomicU32::new(0);
+
+static BINDINGS: OnceLock<RwLock<Bindings>> = OnceLock::new();
+
+fn bindings() -> &'static RwLock<Bindings> {
+    BINDINGS.get_or_init(|| {
+        RwLock::new(Bindings {
+            keys: vec![],
+            panic: (
+                Mods {
+                    win: true,
+                    ctrl: true,
+                    shift: true,
+                    alt: false,
+                },
+                0x52,
+            ),
+            drag_pan: None,
+        })
+    })
+}
+
+/// Подменить привязки (при старте и горячей перезагрузке конфига).
+pub fn set_bindings(b: Bindings) {
+    if let Ok(mut g) = bindings().write() {
+        *g = b;
+    }
+}
+
+fn cur_mods() -> Mods {
+    Mods {
+        win: WIN.load(SeqCst),
+        ctrl: CTRL.load(SeqCst),
+        shift: SHIFT.load(SeqCst),
+        alt: ALT.load(SeqCst),
+    }
+}
+
+/// Действие для комбинации (точное совпадение модификаторов).
+pub fn lookup(b: &Bindings, mods: Mods, vk: u16) -> Option<Action> {
+    b.keys
+        .iter()
+        .find(|k| k.mods == mods && k.vk == vk)
+        .map(|k| k.action)
+}
+
 static DRAG: AtomicBool = AtomicBool::new(false);
 static LAST_X: AtomicI32 = AtomicI32::new(0);
 static LAST_Y: AtomicI32 = AtomicI32::new(0);
@@ -69,40 +105,6 @@ fn send(i: Input) {
     if let Some(tx) = TX.get() {
         let _ = tx.send(i);
     }
-}
-
-/// Привязка клавиши при зажатом Win (без аварийной). Чистая функция — проверяется тестами.
-pub fn map_key(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Input> {
-    let dir = match VIRTUAL_KEY(vk) {
-        VK_LEFT => Some(Dir::Left),
-        VK_RIGHT => Some(Dir::Right),
-        VK_UP => Some(Dir::Up),
-        VK_DOWN => Some(Dir::Down),
-        _ => None,
-    };
-    if ctrl && !alt {
-        if let Some(d) = dir {
-            return (!shift).then_some(Input::Pan(d));
-        }
-        if (0x31..=0x39).contains(&vk) {
-            let n = (vk - 0x30) as u8;
-            return Some(if shift {
-                Input::BookmarkSet(n)
-            } else {
-                Input::BookmarkGo(n)
-            });
-        }
-        return match VIRTUAL_KEY(vk) {
-            VK_TAB => Some(Input::Cycle(!shift)),
-            VK_C if !shift => Some(Input::Center),
-            VK_H if !shift => Some(Input::Home),
-            _ => None,
-        };
-    }
-    if alt && !ctrl && !shift {
-        return dir.map(Input::Focus);
-    }
-    None
 }
 
 fn kb(vk: u16, up: bool) -> INPUT {
@@ -166,34 +168,50 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         unsafe { SendInput(&i, size_of::<INPUT>() as i32) };
                     }
                 }
-                key if WIN.load(SeqCst) => {
-                    let (ctrl, shift, alt) =
-                        (CTRL.load(SeqCst), SHIFT.load(SeqCst), ALT.load(SeqCst));
-                    if ctrl && shift && !alt && key == VK_R {
-                        SWALLOWED.store(true, SeqCst);
+                _ => {
+                    let mods = cur_mods();
+                    let Ok(b) = bindings().read() else {
+                        return unsafe { CallNextHookEx(None, code, wp, lp) };
+                    };
+                    let hit = if (mods, vk) == b.panic {
+                        Some(None)
+                    } else if ENABLED.load(SeqCst) {
+                        lookup(&b, mods, vk).map(Some)
+                    } else {
+                        None
+                    };
+                    drop(b);
+                    if let Some(act) = hit {
+                        if mods.win {
+                            SWALLOWED.store(true, SeqCst);
+                        }
+                        if mods.alt {
+                            ALT_SWALLOWED.store(true, SeqCst);
+                        }
+                        LAST_SWALLOWED_VK.store(vk as u32, SeqCst);
                         if !up {
-                            if let Some(f) = ON_PANIC.get() {
-                                let f = f.clone();
-                                std::thread::spawn(move || f());
+                            match act {
+                                Some(a) => send(Input::Action(a)),
+                                None => {
+                                    if let Some(f) = ON_PANIC.get() {
+                                        let f = f.clone();
+                                        std::thread::spawn(move || f());
+                                    }
+                                    send(Input::Panic);
+                                }
                             }
-                            send(Input::Panic);
                         }
                         return LRESULT(1);
                     }
-                    if ENABLED.load(SeqCst)
-                        && let Some(i) = map_key(vk, ctrl, shift, alt)
+                    // отпускание клавиши перехваченной комбинации, когда модификаторы уже сняты
+                    if up
+                        && LAST_SWALLOWED_VK
+                            .compare_exchange(vk as u32, 0, SeqCst, SeqCst)
+                            .is_ok()
                     {
-                        SWALLOWED.store(true, SeqCst);
-                        if alt {
-                            ALT_SWALLOWED.store(true, SeqCst);
-                        }
-                        if !up {
-                            send(i);
-                        }
                         return LRESULT(1);
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -210,13 +228,20 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     if code >= 0 {
         let m = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
         if m.dwExtraInfo != MAGIC {
-            let mods = WIN.load(SeqCst) && CTRL.load(SeqCst);
+            let mods = bindings()
+                .read()
+                .is_ok_and(|b| b.drag_pan == Some(cur_mods()));
             match wp.0 as u32 {
                 WM_LBUTTONDOWN if mods && ENABLED.load(SeqCst) => {
                     DRAG.store(true, SeqCst);
                     LAST_X.store(m.pt.x, SeqCst);
                     LAST_Y.store(m.pt.y, SeqCst);
-                    SWALLOWED.store(true, SeqCst);
+                    if WIN.load(SeqCst) {
+                        SWALLOWED.store(true, SeqCst);
+                    }
+                    if ALT.load(SeqCst) {
+                        ALT_SWALLOWED.store(true, SeqCst);
+                    }
                     return LRESULT(1);
                 }
                 WM_MOUSEMOVE if DRAG.load(SeqCst) => {
@@ -280,38 +305,33 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dw_core::action::KeyBinding;
+
+    const WC: Mods = Mods {
+        win: true,
+        ctrl: true,
+        shift: false,
+        alt: false,
+    };
+
+    fn table() -> Bindings {
+        Bindings {
+            keys: vec![KeyBinding {
+                mods: WC,
+                vk: 0x27,
+                action: Action::PanViewport(Dir::Right),
+            }],
+            panic: (WC, 0x52),
+            drag_pan: Some(WC),
+        }
+    }
 
     #[test]
-    fn bindings() {
-        assert_eq!(
-            map_key(VK_RIGHT.0, true, false, false),
-            Some(Input::Pan(Dir::Right))
-        );
-        assert_eq!(
-            map_key(VK_LEFT.0, false, false, true),
-            Some(Input::Focus(Dir::Left))
-        );
-        assert_eq!(
-            map_key(VK_TAB.0, true, false, false),
-            Some(Input::Cycle(true))
-        );
-        assert_eq!(
-            map_key(VK_TAB.0, true, true, false),
-            Some(Input::Cycle(false))
-        );
-        assert_eq!(map_key(VK_C.0, true, false, false), Some(Input::Center));
-        assert_eq!(map_key(VK_H.0, true, false, false), Some(Input::Home));
-        assert_eq!(
-            map_key(0x33, true, false, false),
-            Some(Input::BookmarkGo(3))
-        );
-        assert_eq!(
-            map_key(0x33, true, true, false),
-            Some(Input::BookmarkSet(3))
-        );
-        // без нужных модификаторов — ничего не перехватываем
-        assert_eq!(map_key(VK_RIGHT.0, false, false, false), None);
-        assert_eq!(map_key(VK_C.0, false, false, false), None);
-        assert_eq!(map_key(0x30, true, false, false), None);
+    fn lookup_requires_exact_modifiers() {
+        let b = table();
+        assert_eq!(lookup(&b, WC, 0x27), Some(Action::PanViewport(Dir::Right)));
+        assert_eq!(lookup(&b, WC, 0x25), None);
+        assert_eq!(lookup(&b, Mods { shift: true, ..WC }, 0x27), None);
+        assert_eq!(lookup(&b, Mods::default(), 0x27), None);
     }
 }

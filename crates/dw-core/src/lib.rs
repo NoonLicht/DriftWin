@@ -1,5 +1,6 @@
 //! Чистая логика DriftWin без Win32: холст, камера, геометрия, трейт `Platform`.
 
+pub mod action;
 pub mod canvas;
 pub mod nav;
 
