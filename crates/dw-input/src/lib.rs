@@ -4,12 +4,12 @@
 //! Привязки приходят из конфига (`dw-config`) в виде `Bindings` и подменяются на лету
 //! через `set_bindings`; хук только сопоставляет клавишу с таблицей и ставит событие в очередь.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crossbeam_channel::Sender;
 pub use dw_core::Dir;
-use dw_core::action::{Action, Bindings, Mods};
+use dw_core::action::{Action, Bindings, DragKind, Mods, MouseAction, MouseButton};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -19,12 +19,24 @@ pub enum Input {
     Action(Action),
     /// Аварийная клавиша. К моменту отправки колбэк паники уже вызван.
     Panic,
-    /// Смещение курсора при перетаскивании холста, пиксели экрана.
+    /// Нажата кнопка мыши с привязанным перетаскиванием; `x`, `y` — позиция курсора на экране.
+    DragStart {
+        kind: DragKind,
+        x: i32,
+        y: i32,
+    },
+    /// Смещение курсора с прошлого события, пиксели экрана.
     Drag {
         dx: i32,
         dy: i32,
     },
     DragEnd,
+    /// Нажата кнопка мыши с привязанным разовым действием; действует на окно под курсором.
+    Click {
+        action: Action,
+        x: i32,
+        y: i32,
+    },
 }
 
 const MAGIC: usize = 0xD21F7;
@@ -63,7 +75,7 @@ fn bindings() -> &'static RwLock<Bindings> {
                 },
                 0x52,
             ),
-            drag_pan: None,
+            mouse: vec![],
         })
     })
 }
@@ -93,6 +105,11 @@ pub fn lookup(b: &Bindings, mods: Mods, vk: u16) -> Option<Action> {
 }
 
 static DRAG: AtomicBool = AtomicBool::new(false);
+/// Кнопка текущего перетаскивания (индекс `btn_code`) и модификаторы в момент нажатия.
+static DRAG_BTN: AtomicU8 = AtomicU8::new(0);
+static DRAG_MODS: AtomicU8 = AtomicU8::new(0);
+/// Кнопка разового действия, отпускание которой надо проглотить (0 — нет).
+static CLICK_BTN: AtomicU8 = AtomicU8::new(0);
 static LAST_X: AtomicI32 = AtomicI32::new(0);
 static LAST_Y: AtomicI32 = AtomicI32::new(0);
 
@@ -123,6 +140,39 @@ fn kb(vk: u16, up: bool) -> INPUT {
             },
         },
     }
+}
+
+fn mods_bits(m: Mods) -> u8 {
+    u8::from(m.win) | u8::from(m.ctrl) << 1 | u8::from(m.shift) << 2 | u8::from(m.alt) << 3
+}
+
+fn btn_code(b: MouseButton) -> u8 {
+    match b {
+        MouseButton::Left => 1,
+        MouseButton::Right => 2,
+        MouseButton::Middle => 3,
+    }
+}
+
+/// Сообщение мыши -> (кнопка, нажата ли).
+fn button_msg(msg: u32) -> Option<(MouseButton, bool)> {
+    Some(match msg {
+        WM_LBUTTONDOWN => (MouseButton::Left, true),
+        WM_LBUTTONUP => (MouseButton::Left, false),
+        WM_RBUTTONDOWN => (MouseButton::Right, true),
+        WM_RBUTTONUP => (MouseButton::Right, false),
+        WM_MBUTTONDOWN => (MouseButton::Middle, true),
+        WM_MBUTTONUP => (MouseButton::Middle, false),
+        _ => return None,
+    })
+}
+
+/// Привязка мыши для комбинации (точное совпадение модификаторов).
+pub fn lookup_mouse(b: &Bindings, mods: Mods, button: MouseButton) -> Option<MouseAction> {
+    b.mouse
+        .iter()
+        .find(|x| x.mods == mods && x.button == button)
+        .map(|x| x.action)
 }
 
 fn down(vk: VIRTUAL_KEY) -> bool {
@@ -228,39 +278,65 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     if code >= 0 {
         let m = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
         if m.dwExtraInfo != MAGIC {
-            let mods = bindings()
-                .read()
-                .is_ok_and(|b| b.drag_pan == Some(cur_mods()));
-            match wp.0 as u32 {
-                WM_LBUTTONDOWN if mods && ENABLED.load(SeqCst) => {
-                    DRAG.store(true, SeqCst);
-                    LAST_X.store(m.pt.x, SeqCst);
-                    LAST_Y.store(m.pt.y, SeqCst);
-                    if WIN.load(SeqCst) {
-                        SWALLOWED.store(true, SeqCst);
-                    }
-                    if ALT.load(SeqCst) {
-                        ALT_SWALLOWED.store(true, SeqCst);
-                    }
-                    return LRESULT(1);
-                }
-                WM_MOUSEMOVE if DRAG.load(SeqCst) => {
-                    if mods && ENABLED.load(SeqCst) {
-                        let dx = m.pt.x - LAST_X.swap(m.pt.x, SeqCst);
-                        let dy = m.pt.y - LAST_Y.swap(m.pt.y, SeqCst);
-                        if dx != 0 || dy != 0 {
-                            send(Input::Drag { dx, dy });
+            let msg = wp.0 as u32;
+            if let Some((btn, is_down)) = button_msg(msg) {
+                let code = btn_code(btn);
+                if is_down {
+                    if ENABLED.load(SeqCst) && !DRAG.load(SeqCst) {
+                        let mods = cur_mods();
+                        let act = bindings()
+                            .read()
+                            .ok()
+                            .and_then(|b| lookup_mouse(&b, mods, btn));
+                        if let Some(act) = act {
+                            if mods.win {
+                                SWALLOWED.store(true, SeqCst);
+                            }
+                            if mods.alt {
+                                ALT_SWALLOWED.store(true, SeqCst);
+                            }
+                            match act {
+                                MouseAction::Drag(kind) => {
+                                    DRAG.store(true, SeqCst);
+                                    DRAG_BTN.store(code, SeqCst);
+                                    DRAG_MODS.store(mods_bits(mods), SeqCst);
+                                    LAST_X.store(m.pt.x, SeqCst);
+                                    LAST_Y.store(m.pt.y, SeqCst);
+                                    send(Input::DragStart {
+                                        kind,
+                                        x: m.pt.x,
+                                        y: m.pt.y,
+                                    });
+                                }
+                                MouseAction::Click(action) => {
+                                    CLICK_BTN.store(code, SeqCst);
+                                    send(Input::Click {
+                                        action,
+                                        x: m.pt.x,
+                                        y: m.pt.y,
+                                    });
+                                }
+                            }
+                            return LRESULT(1);
                         }
-                    } else {
-                        // модификаторы отпущены раньше кнопки
-                        end_drag();
                     }
-                }
-                WM_LBUTTONUP if DRAG.load(SeqCst) => {
+                } else if DRAG.load(SeqCst) && DRAG_BTN.load(SeqCst) == code {
                     end_drag();
                     return LRESULT(1);
+                } else if CLICK_BTN.compare_exchange(code, 0, SeqCst, SeqCst).is_ok() {
+                    return LRESULT(1);
                 }
-                _ => {}
+            } else if msg == WM_MOUSEMOVE && DRAG.load(SeqCst) {
+                if ENABLED.load(SeqCst) && mods_bits(cur_mods()) == DRAG_MODS.load(SeqCst) {
+                    let dx = m.pt.x - LAST_X.swap(m.pt.x, SeqCst);
+                    let dy = m.pt.y - LAST_Y.swap(m.pt.y, SeqCst);
+                    if dx != 0 || dy != 0 {
+                        send(Input::Drag { dx, dy });
+                    }
+                } else {
+                    // модификаторы отпущены раньше кнопки
+                    end_drag();
+                }
             }
         }
     }
@@ -305,7 +381,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dw_core::action::KeyBinding;
+    use dw_core::action::{KeyBinding, MouseBinding};
 
     const WC: Mods = Mods {
         win: true,
@@ -322,7 +398,11 @@ mod tests {
                 action: Action::PanViewport(Dir::Right),
             }],
             panic: (WC, 0x52),
-            drag_pan: Some(WC),
+            mouse: vec![MouseBinding {
+                mods: WC,
+                button: MouseButton::Left,
+                action: MouseAction::Drag(DragKind::Pan),
+            }],
         }
     }
 
@@ -333,5 +413,17 @@ mod tests {
         assert_eq!(lookup(&b, WC, 0x25), None);
         assert_eq!(lookup(&b, Mods { shift: true, ..WC }, 0x27), None);
         assert_eq!(lookup(&b, Mods::default(), 0x27), None);
+    }
+
+    #[test]
+    fn mouse_lookup_matches_button_and_mods() {
+        let b = table();
+        assert_eq!(
+            lookup_mouse(&b, WC, MouseButton::Left),
+            Some(MouseAction::Drag(DragKind::Pan))
+        );
+        assert_eq!(lookup_mouse(&b, WC, MouseButton::Right), None);
+        assert_eq!(lookup_mouse(&b, Mods::default(), MouseButton::Left), None);
+        assert_ne!(mods_bits(WC), mods_bits(Mods { shift: true, ..WC }));
     }
 }

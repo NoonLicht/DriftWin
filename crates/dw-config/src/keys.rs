@@ -1,6 +1,6 @@
 //! Разбор описаний комбинаций клавиш («mod+ctrl+shift+right») в виртуальные коды.
 
-use dw_core::action::Mods;
+use dw_core::action::{Mods, MouseButton};
 
 use crate::ModKey;
 
@@ -90,20 +90,25 @@ pub fn parse_combo(s: &str, m: ModKey) -> Result<(Mods, u16), String> {
     Ok((mods, vk))
 }
 
-/// Мышиная привязка: модификаторы и кнопка (`left`).
-pub fn parse_mouse_combo(s: &str, m: ModKey) -> Result<Mods, String> {
+/// Мышиная привязка: модификаторы и кнопка (`left`, `right`, `middle`).
+/// Нужен Win или Alt: обычные клики с Ctrl/Shift принадлежат приложениям.
+pub fn parse_mouse_combo(s: &str, m: ModKey) -> Result<(Mods, MouseButton), String> {
     let (mods, key) = split(s, m)?;
-    match key {
-        Some("left") => {}
+    let button = match key.map(str::to_lowercase).as_deref() {
+        Some("left") => MouseButton::Left,
+        Some("right") => MouseButton::Right,
+        Some("middle") => MouseButton::Middle,
         Some(other) => {
             return Err(format!(
-                "кнопка «{other}» пока не поддерживается (только left)"
+                "кнопка «{other}» не поддерживается (left, right, middle)"
             ));
         }
         None => return Err("не указана кнопка мыши".into()),
+    };
+    if !(mods.win || mods.alt) {
+        return Err("нужен Win или Alt (иначе перехватываются обычные клики приложений)".into());
     }
-    check_safe(mods)?;
-    Ok(mods)
+    Ok((mods, button))
 }
 
 /// Строка и столбец (с 1) первого вхождения `needle`.

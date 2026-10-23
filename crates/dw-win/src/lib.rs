@@ -373,6 +373,40 @@ pub fn apply(items: &[(&Managed, ScreenRect)]) {
     }
 }
 
+/// Двигать и менять размер окон (видимый кадр -> оконный прямоугольник), асинхронно.
+pub fn apply_sized(items: &[(&Managed, ScreenRect)]) {
+    let flags =
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS;
+    for (m, r) in items {
+        let x = (r.x - m.border.l).clamp(-PARK_LIMIT, PARK_LIMIT);
+        let y = (r.y - m.border.t).clamp(-PARK_LIMIT, PARK_LIMIT);
+        let (w, h) = (r.w + m.border.l + m.border.r, r.h + m.border.t + m.border.b);
+        unsafe {
+            let _ = SetWindowPos(hwnd_of(m.id), None, x, y, w, h, flags);
+        }
+    }
+}
+
+/// Позиция курсора на виртуальном рабочем столе.
+pub fn cursor_pos() -> (i32, i32) {
+    let mut p = windows::Win32::Foundation::POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+    }
+    (p.x, p.y)
+}
+
+/// Окно верхнего уровня под точкой экрана.
+pub fn window_at(x: i32, y: i32) -> Option<WindowId> {
+    let h = unsafe { WindowFromPoint(windows::Win32::Foundation::POINT { x, y }) };
+    if h.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(h, GA_ROOT) };
+    let root = if root.0.is_null() { h } else { root };
+    Some(WindowId(root.0 as usize as u64))
+}
+
 /// Виртуальный рабочий стол (все мониторы): (x, y, ширина, высота).
 pub fn virtual_screen() -> (i32, i32, i32, i32) {
     unsafe {
@@ -436,9 +470,14 @@ impl Baseline {
     }
 
     /// Запомнить исходный размер окна, изменённого правилом.
-    pub fn set_original_size(&mut self, id: u64, pid: u32, w: i32, h: i32) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id && e.pid == pid) {
-            e.resized_from.get_or_insert((w, h));
+    /// Возвращает `true`, если запись появилась впервые (baseline надо сохранить).
+    pub fn set_original_size(&mut self, id: u64, pid: u32, w: i32, h: i32) -> bool {
+        match self.entries.iter_mut().find(|e| e.id == id && e.pid == pid) {
+            Some(e) if e.resized_from.is_none() => {
+                e.resized_from = Some((w, h));
+                true
+            }
+            _ => false,
         }
     }
 

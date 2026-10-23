@@ -1,4 +1,4 @@
-//! Демон DriftWin, Этапы 1–3: камера, навигация, конфиг и правила для окон из белого списка.
+//! Демон DriftWin, Этапы 1–4: камера, навигация, конфиг и правила, привязка и кластеры для окон из белого списка.
 //!
 //! Безопасность: без `--only`/`[windows] only` или явного `--all` не запускается; при выходе и по аварийной клавише
 //! (Win+Ctrl+Shift+R) окна возвращаются на исходные места; страж возвращает их после падения.
@@ -11,9 +11,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, bail};
 use dw_config::Resolved;
-use dw_core::action::Action;
+use dw_core::action::{Action, DragKind};
 use dw_core::nav::{Inertia, Mru, VelocityTracker};
-use dw_core::{Dir, ScreenRect, Vec2, WindowId, canvas::Canvas};
+use dw_core::snap::{self, Edges, SnapDrag, SnapResize};
+use dw_core::{Dir, Rect, ScreenRect, Vec2, WindowId, canvas::Canvas};
 use dw_input::Input;
 use dw_win::{Baseline, Filter, Managed};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
@@ -28,6 +29,11 @@ use windows::core::w;
 
 /// Через сколько без нажатий переключатель MRU фиксирует выбор.
 const CYCLE_COMMIT: Duration = Duration::from_millis(1500);
+
+/// Минимальный размер окна при изменении размера мышью и клавишами, мир.
+const MIN_WIN: (f64, f64) = (120.0, 80.0);
+/// Через сколько после изменения размера проверяем, что приложение его приняло.
+const SIZE_CHECK: Duration = Duration::from_millis(350);
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -159,6 +165,63 @@ fn tray_icon() -> Icon {
     Icon::from_rgba(px, 16, 16).expect("icon")
 }
 
+/// Перетаскивание, которое сейчас идёт.
+enum Drag {
+    Pan,
+    Move {
+        ids: Vec<WindowId>,
+        /// Прямоугольники `ids` в начале перетаскивания.
+        start: Vec<Rect>,
+        /// Остальные окна (неподвижные цели привязки).
+        others: Vec<Rect>,
+        /// Суммарное смещение курсора в мире (вместе с прокруткой камеры у края).
+        raw: Vec2,
+        snap: SnapDrag,
+    },
+    Resize {
+        id: WindowId,
+        edges: Edges,
+        start: Rect,
+        raw: Vec2,
+        snap: SnapResize,
+        /// Раскладка в начале: по ней сдвигаются соседи при изменении размера кластера.
+        items: Vec<(WindowId, Rect)>,
+        others: Vec<Rect>,
+        cluster: bool,
+    },
+}
+
+fn dir_vec(d: Dir) -> Vec2 {
+    match d {
+        Dir::Right => Vec2::new(1.0, 0.0),
+        Dir::Left => Vec2::new(-1.0, 0.0),
+        Dir::Up => Vec2::new(0.0, 1.0),
+        Dir::Down => Vec2::new(0.0, -1.0),
+    }
+}
+
+fn same_rect(a: &Rect, b: &Rect) -> bool {
+    (a.center.x - b.center.x).abs() < 2.0
+        && (a.center.y - b.center.y).abs() < 2.0
+        && (a.w - b.w).abs() < 2.0
+        && (a.h - b.h).abs() < 2.0
+}
+
+/// Действия, которые применяются к одному окну (в фокусе или под курсором).
+fn is_window_action(a: Action) -> bool {
+    matches!(
+        a,
+        Action::NudgeWindow(_)
+            | Action::MoveToSnap(_)
+            | Action::GrowWindow(_)
+            | Action::ShrinkWindow(_)
+            | Action::ResizeToSnap(_)
+            | Action::FitWindow
+            | Action::FitWindowSnapped
+            | Action::FillWindow
+    )
+}
+
 struct App {
     canvas: Canvas,
     managed: HashMap<WindowId, Managed>,
@@ -188,6 +251,17 @@ struct App {
     /// Последнее увиденное окно в фокусе (чтобы реагировать только на смену).
     fg_seen: Option<WindowId>,
     last_cycle: Option<Instant>,
+    drag: Option<Drag>,
+    /// Окно на весь монитор и его прежний прямоугольник.
+    fullscreen: Option<(WindowId, Rect)>,
+    /// Для повторного fit/fill: (прямоугольник до, прямоугольник после).
+    undo: HashMap<WindowId, (Rect, Rect)>,
+    /// Окна, которым меняли размер: проверить, принял ли его процесс.
+    size_checks: Vec<(WindowId, Instant)>,
+    cursor_pan_on: bool,
+    edge_since: Option<Instant>,
+    /// Угол, в котором сейчас курсор (0 — левый верхний, по часовой стрелке).
+    in_corner: Option<usize>,
 }
 
 impl App {
@@ -202,7 +276,10 @@ impl App {
                 if idle
                     && let (Some(cur), Some(prev)) =
                         (dw_win::current_visible(&m), self.last.get(&m.id))
-                    && ((cur.x - prev.x).abs() > 2 || (cur.y - prev.y).abs() > 2)
+                    && ((cur.x - prev.x).abs() > 2
+                        || (cur.y - prev.y).abs() > 2
+                        || (cur.w - prev.w).abs() > 2
+                        || (cur.h - prev.h).abs() > 2)
                 {
                     self.canvas.adopt(m.id, cur);
                     self.last.insert(m.id, cur);
@@ -236,6 +313,10 @@ impl App {
             self.canvas.forget(id);
             self.mru.remove(id);
             self.last.remove(&id);
+            self.undo.remove(&id);
+            if self.fullscreen.is_some_and(|f| f.0 == id) {
+                self.fullscreen = None;
+            }
         }
         for s in skipped {
             tracing::debug!("не управляется: {} «{}» — {}", s.exe, s.title, s.reason);
@@ -262,8 +343,9 @@ impl App {
             );
             {
                 let mut b = self.baseline.lock().unwrap();
-                b.set_original_size(m.id.0, m.pid, orig.0, orig.1);
-                let _ = b.save(&self.baseline_path);
+                if b.set_original_size(m.id.0, m.pid, orig.0, orig.1) {
+                    let _ = b.save(&self.baseline_path);
+                }
             }
             vis.w = w;
             vis.h = h;
@@ -313,6 +395,9 @@ impl App {
             tracing::warn!("конфиг: {w}");
         }
         let new = loaded.config;
+        if new.navigation.edge_pan.cursor_pan != self.cfg.navigation.edge_pan.cursor_pan {
+            self.cursor_pan_on = new.navigation.edge_pan.cursor_pan;
+        }
         dw_input::set_bindings(new.bindings.clone());
         self.filter.exclude_exe = filter_from(&new, None).exclude_exe;
         self.filter.exclude_class = filter_from(&new, None).exclude_class;
@@ -357,6 +442,10 @@ impl App {
         self.inertia.stop();
         self.mru = Mru::default();
         self.applied = self.canvas.viewport.center;
+        self.drag = None;
+        self.fullscreen = None;
+        self.undo.clear();
+        self.size_checks.clear();
     }
 
     fn now_secs(&self) -> f64 {
@@ -367,6 +456,8 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
         self.last_tick = now;
+        self.edge_pan(dt);
+        self.hot_corners();
         if self.inertia.active() {
             let d = self.inertia.step(dt);
             let c = self.canvas.viewport.center;
@@ -401,6 +492,8 @@ impl App {
                     .get(id)
                     .is_none_or(|p| on_desktop(p, vs) || on_desktop(r, vs))
             })
+            // окну, которое уже стоит где надо, команда не нужна (важно при перетаскивании: двигается одно окно)
+            .filter(|(id, r)| self.last.get(id) != Some(r))
             .filter_map(|(id, r)| {
                 self.managed
                     .get(id)
@@ -408,9 +501,367 @@ impl App {
                     .map(|m| (m, *r))
             })
             .collect();
-        dw_win::apply(&items);
+        let mut moved: Vec<(&Managed, ScreenRect)> = Vec::new();
+        let mut sized: Vec<(&Managed, ScreenRect)> = Vec::new();
+        for &(m, r) in &items {
+            if self
+                .last
+                .get(&m.id)
+                .is_some_and(|p| (p.w, p.h) != (r.w, r.h))
+            {
+                sized.push((m, r));
+            } else {
+                moved.push((m, r));
+            }
+        }
+        dw_win::apply(&moved);
+        dw_win::apply_sized(&sized);
         for (m, r) in items {
             self.last.insert(m.id, r);
+        }
+        for (m, _) in sized {
+            self.size_checks.retain(|(i, _)| *i != m.id);
+            self.size_checks.push((m.id, now + SIZE_CHECK));
+        }
+    }
+
+    // ---------- перетаскивание, привязка, кластеры ----------
+
+    /// Окно под точкой экрана, если оно под управлением и живёт на холсте.
+    fn canvas_window_at(&self, x: i32, y: i32) -> Option<WindowId> {
+        dw_win::window_at(x, y).filter(|id| {
+            self.managed.contains_key(id)
+                && self.canvas.contains(*id)
+                && !self.canvas.is_pinned(*id)
+                && !self.canvas.is_widget(*id)
+        })
+    }
+
+    fn begin_drag(&mut self, kind: DragKind, x: i32, y: i32) {
+        self.exit_fullscreen();
+        self.inertia.stop();
+        self.target = self.canvas.viewport.center;
+        if kind == DragKind::Pan {
+            self.drag = Some(Drag::Pan);
+            return;
+        }
+        let Some(id) = self.canvas_window_at(x, y) else {
+            self.drag = None;
+            return;
+        };
+        if dw_win::foreground() != Some(id)
+            && let Some(m) = self.managed.get(&id)
+        {
+            dw_win::focus(m);
+        }
+        self.fg_seen = Some(id);
+        self.mru.touch(id);
+        let items = self.canvas.snap_items();
+        let gap = self.cfg.snap.gap;
+        let Some(rect) = self.canvas.rect(id) else {
+            self.drag = None;
+            return;
+        };
+        self.drag = Some(match kind {
+            DragKind::MoveWindow | DragKind::MoveCluster => {
+                let ids = if kind == DragKind::MoveCluster {
+                    snap::cluster_of(&items, id, gap)
+                } else {
+                    vec![id]
+                };
+                Drag::Move {
+                    start: ids.iter().filter_map(|i| self.canvas.rect(*i)).collect(),
+                    others: items
+                        .iter()
+                        .filter(|(i, _)| !ids.contains(i))
+                        .map(|(_, r)| *r)
+                        .collect(),
+                    ids,
+                    raw: Vec2::default(),
+                    snap: SnapDrag::default(),
+                }
+            }
+            _ => {
+                let cluster = kind == DragKind::ResizeCluster;
+                // привязываться к окнам своего же кластера бессмысленно: они сдвигаются вместе с нами
+                let mine = if cluster {
+                    snap::cluster_of(&items, id, gap)
+                } else {
+                    vec![id]
+                };
+                let p = self.canvas.screen_point_to_world(x, y);
+                Drag::Resize {
+                    id,
+                    edges: Edges::nearest_corner(&rect, p),
+                    start: rect,
+                    raw: Vec2::default(),
+                    snap: SnapResize::default(),
+                    others: items
+                        .iter()
+                        .filter(|(i, _)| !mine.contains(i))
+                        .map(|(_, r)| *r)
+                        .collect(),
+                    items,
+                    cluster,
+                }
+            }
+        });
+    }
+
+    /// Сдвинуть перетаскиваемое на дельту в мире (курсор или прокрутка камеры) и применить привязку.
+    fn drag_by(&mut self, dw: Vec2) {
+        let cfg = self.cfg.snap;
+        let changes = match self.drag.as_mut() {
+            Some(Drag::Move {
+                ids,
+                start,
+                others,
+                raw,
+                snap,
+            }) => {
+                *raw = *raw + dw;
+                let d = snap.update(*raw, start, others, &cfg);
+                ids.iter()
+                    .zip(start.iter())
+                    .map(|(id, r)| {
+                        (
+                            *id,
+                            Rect {
+                                center: r.center + d,
+                                ..*r
+                            },
+                        )
+                    })
+                    .collect()
+            }
+            Some(Drag::Resize {
+                id,
+                edges,
+                start,
+                raw,
+                snap,
+                items,
+                others,
+                cluster,
+            }) => {
+                *raw = *raw + dw;
+                let new = snap.update(start, *edges, *raw, others, &cfg, MIN_WIN);
+                if *cluster {
+                    snap::resize_keep_cluster(items, *id, new, cfg.gap)
+                } else {
+                    vec![(*id, new)]
+                }
+            }
+            _ => return,
+        };
+        self.set_rects(changes);
+    }
+
+    /// Записать новые прямоугольники окон; изменение размера запоминается в baseline (вернуть при выходе).
+    fn set_rects(&mut self, changes: Vec<(WindowId, Rect)>) {
+        for (id, r) in changes {
+            let Some(old) = self.canvas.rect(id) else {
+                continue;
+            };
+            if old == r {
+                continue;
+            }
+            if (old.w.round(), old.h.round()) != (r.w.round(), r.h.round())
+                && let Some(m) = self.managed.get(&id)
+            {
+                let (w, h) = (
+                    old.w as i32 + m.border.l + m.border.r,
+                    old.h as i32 + m.border.t + m.border.b,
+                );
+                let mut b = self.baseline.lock().unwrap();
+                if b.set_original_size(m.id.0, m.pid, w, h) {
+                    let _ = b.save(&self.baseline_path);
+                }
+            }
+            self.canvas.set_rect(id, r);
+        }
+        self.force_layout = true;
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        if self.fullscreen.is_some() {
+            self.exit_fullscreen();
+            return;
+        }
+        let Some(id) = self.focused_nav() else {
+            return;
+        };
+        let Some(prev) = self.canvas.rect(id) else {
+            return;
+        };
+        self.inertia.stop();
+        self.target = self.canvas.viewport.center;
+        self.fullscreen = Some((id, prev));
+        let view = self.canvas.view_rect();
+        self.set_rects(vec![(id, view)]);
+    }
+
+    fn exit_fullscreen(&mut self) {
+        if let Some((id, prev)) = self.fullscreen.take() {
+            self.set_rects(vec![(id, prev)]);
+        }
+    }
+
+    /// Первый вызов — применить `fresh`, повторный (окно ещё в этом состоянии) — вернуть прежний.
+    fn toggled(&mut self, id: WindowId, cur: Rect, fresh: Rect) -> Rect {
+        if let Some((before, after)) = self.undo.get(&id).copied()
+            && same_rect(&cur, &after)
+        {
+            self.undo.remove(&id);
+            return before;
+        }
+        self.undo.insert(id, (cur, fresh));
+        fresh
+    }
+
+    fn window_action(&mut self, a: Action, id: WindowId) {
+        let Some(rect) = self.canvas.rect(id) else {
+            return;
+        };
+        let snap_cfg = self.cfg.snap;
+        let nav = &self.cfg.navigation;
+        let (nudge, step) = (nav.nudge_step, nav.resize_step);
+        let items = self.canvas.snap_items();
+        let others: Vec<Rect> = items
+            .iter()
+            .filter(|(i, _)| *i != id)
+            .map(|(_, r)| *r)
+            .collect();
+        let shifted = |v: Vec2| Rect {
+            center: rect.center + v,
+            ..rect
+        };
+        let view = self.canvas.view_rect();
+        let changes = match a {
+            Action::NudgeWindow(d) => vec![(id, shifted(dir_vec(d) * nudge))],
+            Action::MoveToSnap(d) => match snap::next_snap(&rect, &others, d, &snap_cfg) {
+                Some(dist) => vec![(id, shifted(dir_vec(d) * dist))],
+                None => return,
+            },
+            Action::GrowWindow(d) | Action::ShrinkWindow(d) => {
+                let sign = if matches!(a, Action::GrowWindow(_)) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let new = snap::resize_by(
+                    &rect,
+                    Edges::from_dir(d),
+                    dir_vec(d) * (step * sign),
+                    MIN_WIN,
+                );
+                snap::resize_keep_cluster(&items, id, new, snap_cfg.gap)
+            }
+            Action::ResizeToSnap(d) => match snap::extend_side(&rect, &others, d, &snap_cfg) {
+                Some(new) => snap::resize_keep_cluster(&items, id, new, snap_cfg.gap),
+                None => return,
+            },
+            Action::FitWindow | Action::FitWindowSnapped => {
+                let fresh = snap::fit_rect(&view, self.cfg.fit_padding);
+                let new = self.toggled(id, rect, fresh);
+                if a == Action::FitWindowSnapped {
+                    snap::resize_keep_cluster(&items, id, new, snap_cfg.gap)
+                } else {
+                    vec![(id, new)]
+                }
+            }
+            Action::FillWindow => {
+                let fresh = snap::fill_rect(&rect, &others, &view, &snap_cfg);
+                if same_rect(&fresh, &rect) && !self.undo.contains_key(&id) {
+                    return;
+                }
+                vec![(id, self.toggled(id, rect, fresh))]
+            }
+            _ => return,
+        };
+        self.set_rects(changes);
+    }
+
+    /// Прокрутка вида у края экрана: при перетаскивании окна и (по желанию) просто курсором.
+    fn edge_pan(&mut self, dt: f64) {
+        let ep = self.cfg.navigation.edge_pan.clone();
+        let dragging = matches!(self.drag, Some(Drag::Move { .. } | Drag::Resize { .. }));
+        let by_cursor = self.cursor_pan_on && self.drag.is_none() && self.fullscreen.is_none();
+        if !dragging && !by_cursor {
+            self.edge_since = None;
+            return;
+        }
+        let zone = if dragging { ep.zone } else { ep.cursor_zone };
+        let (cx, cy) = dw_win::cursor_pos();
+        let (ox, oy) = self.canvas.origin;
+        let (w, h) = (
+            self.canvas.viewport.size_px.0 as f64,
+            self.canvas.viewport.size_px.1 as f64,
+        );
+        let (px, py) = ((cx - ox) as f64, (cy - oy) as f64);
+        if px < 0.0 || py < 0.0 || px >= w || py >= h {
+            self.edge_since = None;
+            return;
+        }
+        let depth = |dist: f64| (1.0 - dist / zone).clamp(0.0, 1.0);
+        let sx = depth(w - 1.0 - px) - depth(px);
+        let sy = depth(h - 1.0 - py) - depth(py);
+        if sx == 0.0 && sy == 0.0 {
+            self.edge_since = None;
+            return;
+        }
+        if !dragging {
+            let since = *self.edge_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < Duration::from_millis(ep.latency_ms) {
+                return;
+            }
+        }
+        let speed = |s: f64| {
+            if s == 0.0 {
+                0.0
+            } else {
+                s.signum() * (ep.speed_min + (ep.speed_max - ep.speed_min) * s.abs())
+            }
+        };
+        let k = dt * 60.0;
+        let (dx, dy) = (speed(sx) * k, speed(sy) * k);
+        self.inertia.stop();
+        self.canvas.pan_px(dx, dy);
+        self.target = self.canvas.viewport.center;
+        if dragging {
+            // окно едет вместе с камерой и остаётся под курсором
+            let z = self.canvas.viewport.zoom;
+            self.drag_by(Vec2::new(dx / z, -dy / z));
+        }
+    }
+
+    /// Горячие углы: действие срабатывает один раз при входе курсора в угол.
+    fn hot_corners(&mut self) {
+        let hc = self.cfg.hot_corners.clone();
+        let acts = [hc.top_left, hc.top_right, hc.bottom_right, hc.bottom_left];
+        if acts.iter().all(Option::is_none) || self.drag.is_some() || self.fullscreen.is_some() {
+            self.in_corner = None;
+            return;
+        }
+        let (cx, cy) = dw_win::cursor_pos();
+        let (ox, oy) = self.canvas.origin;
+        let (w, h) = self.canvas.viewport.size_px;
+        let (px, py) = (cx - ox, cy - oy);
+        let inside = (0..w as i32).contains(&px) && (0..h as i32).contains(&py);
+        let (l, r) = (px <= hc.threshold, px >= w as i32 - 1 - hc.threshold);
+        let (t, b) = (py <= hc.threshold, py >= h as i32 - 1 - hc.threshold);
+        let now = match (inside, l, r, t, b) {
+            (true, true, _, true, _) => Some(0),
+            (true, _, true, true, _) => Some(1),
+            (true, _, true, _, true) => Some(2),
+            (true, true, _, _, true) => Some(3),
+            _ => None,
+        };
+        if now != self.in_corner {
+            self.in_corner = now;
+            if let Some(a) = now.and_then(|i| acts[i]) {
+                self.run_action(a);
+            }
         }
     }
 
@@ -455,6 +906,7 @@ impl App {
         self.mru.touch(id);
         if self.cfg.navigation.auto_navigate
             && !self.no_auto_navigate
+            && self.drag.is_none()
             && let Some(r) = self.canvas.screen_rect(id)
         {
             let (ox, oy) = self.canvas.origin;
@@ -470,18 +922,38 @@ impl App {
     fn handle(&mut self, ev: Input) {
         match ev {
             Input::Action(a) => self.run_action(a),
-            Input::Drag { dx, dy } => {
-                let k = self.cfg.navigation.mouse_speed;
-                let (dx, dy) = (dx as f64 * k, dy as f64 * k);
-                self.inertia.stop();
-                self.canvas.pan_px(-dx, -dy);
-                self.target = self.canvas.viewport.center;
-                self.tracker.push(self.now_secs(), Vec2::new(-dx, dy));
-            }
+            Input::DragStart { kind, x, y } => self.begin_drag(kind, x, y),
+            Input::Drag { dx, dy } => match self.drag {
+                Some(Drag::Pan) => {
+                    let k = self.cfg.navigation.mouse_speed;
+                    let (dx, dy) = (dx as f64 * k, dy as f64 * k);
+                    self.inertia.stop();
+                    self.canvas.pan_px(-dx, -dy);
+                    self.target = self.canvas.viewport.center;
+                    self.tracker.push(self.now_secs(), Vec2::new(-dx, dy));
+                }
+                Some(_) => {
+                    let z = self.canvas.viewport.zoom;
+                    self.drag_by(Vec2::new(dx as f64 / z, -(dy as f64) / z));
+                }
+                None => {}
+            },
             Input::DragEnd => {
-                let v = self.tracker.velocity(self.now_secs());
-                self.tracker.clear();
-                self.inertia.fling(v);
+                if matches!(self.drag.take(), Some(Drag::Pan)) {
+                    let v = self.tracker.velocity(self.now_secs());
+                    self.tracker.clear();
+                    self.inertia.fling(v);
+                }
+            }
+            Input::Click { action, x, y } => {
+                if is_window_action(action) {
+                    self.exit_fullscreen();
+                    if let Some(id) = self.canvas_window_at(x, y) {
+                        self.window_action(action, id);
+                    }
+                } else {
+                    self.run_action(action);
+                }
             }
             Input::Panic => {}
         }
@@ -497,7 +969,35 @@ impl App {
     }
 
     fn run_action(&mut self, a: Action) {
+        // любое действие с холстом выводит окно из полноэкранного режима
+        if !matches!(
+            a,
+            Action::ToggleFullscreen
+                | Action::CloseWindow
+                | Action::Quit
+                | Action::ReloadConfig
+                | Action::ToggleCursorPan
+        ) {
+            self.exit_fullscreen();
+        }
         match a {
+            a if is_window_action(a) => {
+                if let Some(id) = self.focused_nav() {
+                    self.window_action(a, id);
+                }
+            }
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
+            Action::ToggleCursorPan => {
+                self.cursor_pan_on = !self.cursor_pan_on;
+                tracing::info!(
+                    "прокрутка вида курсором у края: {}",
+                    if self.cursor_pan_on {
+                        "вкл"
+                    } else {
+                        "выкл"
+                    }
+                );
+            }
             Action::PanViewport(d) => {
                 self.inertia.stop();
                 let step = self.cfg.navigation.pan_step;
@@ -584,11 +1084,44 @@ impl App {
             }
             Action::ReloadConfig => self.reload_config(),
             Action::Quit => QUIT.store(true, SeqCst),
+            // остальные варианты обработаны выше (действия над окном)
+            _ => {}
         }
     }
 
     /// Периодические дела: фиксация выбора MRU-переключателя.
     fn housekeeping(&mut self) {
+        // приложение могло не принять размер (минимум, фиксированный размер): берём фактический
+        if self.drag.is_none() && !self.size_checks.is_empty() {
+            let now = Instant::now();
+            let due: Vec<_> = self
+                .size_checks
+                .iter()
+                .filter(|(_, t)| *t <= now)
+                .map(|(i, _)| *i)
+                .collect();
+            self.size_checks.retain(|(_, t)| *t > now);
+            for id in due {
+                let (Some(m), Some(r)) = (self.managed.get(&id), self.canvas.rect(id)) else {
+                    continue;
+                };
+                if let Some(cur) = dw_win::current_visible(m)
+                    && ((cur.w - r.w.round() as i32).abs() > 2
+                        || (cur.h - r.h.round() as i32).abs() > 2)
+                {
+                    tracing::debug!(
+                        "«{}» не приняло размер {}x{}, фактический {}x{}",
+                        m.title,
+                        r.w,
+                        r.h,
+                        cur.w,
+                        cur.h
+                    );
+                    self.canvas.adopt(id, cur);
+                    self.last.insert(id, cur);
+                }
+            }
+        }
         if let Some(t) = self.last_cycle
             && t.elapsed() > CYCLE_COMMIT
         {
@@ -757,7 +1290,15 @@ fn main() -> Result<()> {
         applied: target,
         fg_seen: dw_win::foreground(),
         last_cycle: None,
+        drag: None,
+        fullscreen: None,
+        undo: HashMap::new(),
+        size_checks: Vec::new(),
+        cursor_pan_on: false,
+        edge_since: None,
+        in_corner: None,
     };
+    app.cursor_pan_on = app.cfg.navigation.edge_pan.cursor_pan;
     app.rescan();
     tracing::info!(
         "готово: окон под управлением {}, монитор {w}x{h}, конфиг {} (по умолчанию аварийный возврат — Win+Ctrl+Shift+R)",

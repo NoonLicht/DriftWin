@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use dw_core::Dir;
-use dw_core::action::{Action, Bindings, KeyBinding, Mods};
+use dw_core::action::{
+    Action, Bindings, DragKind, KeyBinding, Mods, MouseAction, MouseBinding, MouseButton,
+};
+use dw_core::snap::SnapCfg;
 use serde::Deserialize;
 
 pub use rules::{Matcher, Resolved, Rule};
@@ -44,8 +47,36 @@ pub struct Windows {
     pub max_fps: u32,
 }
 
+/// Прокрутка вида у края экрана (`[navigation.edge_pan]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePan {
+    /// Ширина зоны у края при перетаскивании окна, пиксели.
+    pub zone: f64,
+    /// Скорость на границе зоны и у самого края, пикселей за кадр при 60 кадрах/с.
+    pub speed_min: f64,
+    pub speed_max: f64,
+    /// Прокручивать вид курсором без перетаскивания (переключается `toggle-cursor-pan`).
+    pub cursor_pan: bool,
+    pub cursor_zone: f64,
+    /// Сколько курсор должен постоять у края, мс.
+    pub latency_ms: u64,
+}
+
+/// Горячие углы основного монитора (`[hot_corners]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotCorners {
+    pub threshold: i32,
+    pub top_left: Option<Action>,
+    pub top_right: Option<Action>,
+    pub bottom_left: Option<Action>,
+    pub bottom_right: Option<Action>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Navigation {
+    pub nudge_step: f64,
+    pub resize_step: f64,
+    pub edge_pan: EdgePan,
     pub pan_step: f64,
     /// Доля оставшегося пути камеры, проходимая за кадр (0..1].
     pub camera_speed: f64,
@@ -61,6 +92,10 @@ pub struct Config {
     pub navigation: Navigation,
     pub bindings: Bindings,
     pub rules: Vec<Rule>,
+    pub snap: SnapCfg,
+    /// Отступ окна от края вида при fit-window (`[zoom] fit_padding`).
+    pub fit_padding: f64,
+    pub hot_corners: HotCorners,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,15 +137,58 @@ struct RawConfig {
     mouse: RawMouse,
     window_rules: Vec<rules::RawRule>,
     // секции плана, которые появятся в следующих этапах
-    zoom: Option<toml::Value>,
+    zoom: RawZoom,
     background: Option<toml::Value>,
-    snap: Option<toml::Value>,
+    snap: RawSnap,
+    hot_corners: RawHotCorners,
     decorations: Option<toml::Value>,
     effects: Option<toml::Value>,
     gestures: Option<toml::Value>,
     touch: Option<toml::Value>,
     outputs: Option<toml::Value>,
     session: Option<toml::Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawSnap {
+    enabled: Option<bool>,
+    gap: Option<f64>,
+    outer_gap: Option<f64>,
+    distance: Option<f64>,
+    break_force: Option<f64>,
+    corners: Option<bool>,
+    centers: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawZoom {
+    fit_padding: Option<f64>,
+    /// Остальные ключи [zoom] ещё не реализованы.
+    #[serde(flatten)]
+    rest: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawEdgePan {
+    zone: Option<f64>,
+    speed_min: Option<f64>,
+    speed_max: Option<f64>,
+    cursor_pan: Option<bool>,
+    cursor_zone: Option<f64>,
+    latency_ms: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawHotCorners {
+    threshold: Option<i64>,
+    top_left: Option<String>,
+    top_right: Option<String>,
+    bottom_left: Option<String>,
+    bottom_right: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -147,10 +225,10 @@ struct RawNavigation {
     drift: Option<toml::Value>,
     auto_navigate_on_close: Option<toml::Value>,
     auto_navigate_on_click: Option<toml::Value>,
-    nudge_step: Option<toml::Value>,
-    resize_step: Option<toml::Value>,
+    nudge_step: Option<f64>,
+    resize_step: Option<f64>,
     anchors: Option<toml::Value>,
-    edge_pan: Option<toml::Value>,
+    edge_pan: RawEdgePan,
 }
 
 #[derive(Deserialize, Default)]
@@ -188,22 +266,12 @@ const UNSUPPORTED_ACTIONS: &[&str] = &[
     "exec-launcher",
     "spawn",
     "suspend-window",
-    "nudge-window",
-    "move-to-snap",
-    "grow-window",
-    "shrink-window",
-    "resize-to-snap",
     "zoom-in",
     "zoom-out",
     "zoom-reset",
     "move-to-bookmark",
     "zoom-to-fit",
     "zoom-to-fit-snapped",
-    "toggle-fullscreen",
-    "fit-window",
-    "fit-window-snapped",
-    "fill-window",
-    "toggle-cursor-pan",
     "set-trackpad",
     "send-to-output",
     "send-cursor-to-output",
@@ -261,6 +329,16 @@ fn parse_action(src: &str) -> Result<ParsedAction, String> {
         "close-window" => Action::CloseWindow,
         "reload-config" => Action::ReloadConfig,
         "quit" => Action::Quit,
+        "nudge-window" => Action::NudgeWindow(parse_dir(arg)?),
+        "move-to-snap" => Action::MoveToSnap(parse_dir(arg)?),
+        "grow-window" => Action::GrowWindow(parse_dir(arg)?),
+        "shrink-window" => Action::ShrinkWindow(parse_dir(arg)?),
+        "resize-to-snap" => Action::ResizeToSnap(parse_dir(arg)?),
+        "toggle-fullscreen" => Action::ToggleFullscreen,
+        "fit-window-snapped" => Action::FitWindowSnapped,
+        "fit-window" => Action::FitWindow,
+        "fill-window" => Action::FillWindow,
+        "toggle-cursor-pan" => Action::ToggleCursorPan,
         n if UNSUPPORTED_ACTIONS.contains(&n) => return Ok(ParsedAction::Unsupported(n.into())),
         n => return Err(format!("неизвестное действие «{n}»")),
     };
@@ -286,6 +364,20 @@ fn default_keybindings(m: ModKey) -> Vec<(String, String)> {
     for n in 1..=9 {
         v.push((format!("mod+ctrl+{n}"), format!("go-to-bookmark {n}")));
         v.push((format!("mod+ctrl+shift+{n}"), format!("set-bookmark {n}")));
+    }
+    // с Alt в роли mod буквенные комбинации «alt+буква» открывали бы меню приложений, поэтому добавляем Ctrl
+    let letter = match m {
+        ModKey::Super => "mod",
+        ModKey::Alt => "mod+ctrl",
+    };
+    v.push((format!("{letter}+f"), "toggle-fullscreen".into()));
+    v.push((format!("{letter}+m"), "fit-window-snapped".into()));
+    v.push((format!("{letter}+shift+m"), "fit-window".into()));
+    v.push((format!("{letter}+shift+f"), "fill-window".into()));
+    if m == ModKey::Super {
+        for (n, _) in DIRS {
+            v.push((format!("mod+shift+{n}"), format!("move-to-snap {n}")));
+        }
     }
     v
 }
@@ -359,12 +451,77 @@ fn compile_keys(raw: &RawConfig, m: ModKey, cx: &mut Ctx) -> Vec<KeyBinding> {
         .collect()
 }
 
-fn compile_mouse(raw: &RawConfig, m: ModKey, cx: &mut Ctx) -> Option<Mods> {
-    let mut drag = if raw.bindings.disable_defaults.iter().any(|d| d == "mouse") {
-        None
-    } else {
-        keys::parse_combo("mod+ctrl+left", m).ok().map(|k| k.0)
+fn mouse_drag_kind(name: &str) -> Option<DragKind> {
+    Some(match name {
+        "pan-viewport" => DragKind::Pan,
+        "move-window" => DragKind::MoveWindow,
+        "move-snapped-windows" => DragKind::MoveCluster,
+        "resize-window" => DragKind::ResizeWindow,
+        "resize-window-snapped" => DragKind::ResizeCluster,
+        _ => return None,
+    })
+}
+
+/// Стандартные привязки мыши (§2.4 плана).
+fn default_mouse(m: ModKey) -> Vec<MouseBinding> {
+    let mods = |win, ctrl, shift, alt| Mods {
+        win,
+        ctrl,
+        shift,
+        alt,
     };
+    let mod_only = match m {
+        ModKey::Super => mods(true, false, false, false),
+        ModKey::Alt => mods(false, false, false, true),
+    };
+    let alt = mods(false, false, false, true);
+    let alt_shift = mods(false, false, true, true);
+    let drag = |mods, button, k| MouseBinding {
+        mods,
+        button,
+        action: MouseAction::Drag(k),
+    };
+    let click = |mods, button, a| MouseBinding {
+        mods,
+        button,
+        action: MouseAction::Click(a),
+    };
+    use MouseButton::{Left, Middle, Right};
+    // fill-window на mod+СКМ; когда mod = Alt, это совпало бы с fit-window-snapped, поэтому добавляем Ctrl
+    let fill_mods = Mods {
+        ctrl: m == ModKey::Alt,
+        ..mod_only
+    };
+    vec![
+        drag(
+            Mods {
+                ctrl: true,
+                ..mod_only
+            },
+            Left,
+            DragKind::Pan,
+        ),
+        drag(alt, Left, DragKind::MoveWindow),
+        drag(alt_shift, Left, DragKind::MoveCluster),
+        drag(alt, Right, DragKind::ResizeCluster),
+        drag(alt_shift, Right, DragKind::ResizeWindow),
+        click(alt, Middle, Action::FitWindowSnapped),
+        click(alt_shift, Middle, Action::FitWindow),
+        click(fill_mods, Middle, Action::FillWindow),
+    ]
+}
+
+fn compile_mouse(raw: &RawConfig, m: ModKey, cx: &mut Ctx) -> Vec<MouseBinding> {
+    let mut table: Vec<((Mods, MouseButton), Option<MouseAction>)> = Vec::new();
+    let mut put = |k: (Mods, MouseButton), a: Option<MouseAction>| {
+        table.retain(|(x, _)| *x != k);
+        table.push((k, a));
+    };
+    if !raw.bindings.disable_defaults.iter().any(|d| d == "mouse") {
+        for b in default_mouse(m) {
+            put((b.mods, b.button), Some(b.action));
+        }
+    }
     for (combo, act) in &raw.mouse.anywhere {
         let k = match keys::parse_mouse_combo(combo, m) {
             Ok(k) => k,
@@ -373,21 +530,39 @@ fn compile_mouse(raw: &RawConfig, m: ModKey, cx: &mut Ctx) -> Option<Mods> {
                 continue;
             }
         };
-        match act.trim() {
-            "none" => {
-                if drag == Some(k) {
-                    drag = None;
-                }
-            }
-            // для мыши `pan-viewport` без направления означает «двигать холст перетаскиванием»
-            "pan-viewport" => drag = Some(k),
-            other => cx.warn_at(
+        let name = act.trim();
+        if let Some(kind) = mouse_drag_kind(name) {
+            put(k, Some(MouseAction::Drag(kind)));
+            continue;
+        }
+        match parse_action(name) {
+            Ok(ParsedAction::None) => put(k, None),
+            Ok(ParsedAction::Action(a)) => put(k, Some(MouseAction::Click(a))),
+            Ok(ParsedAction::Unsupported(n)) => cx.warn_at(
                 combo,
-                format!("для мыши пока поддерживается только pan-viewport, «{other}» пропущено"),
+                format!("действие «{n}» пока не поддерживается, привязка «{combo}» пропущена"),
             ),
+            Err(e) => cx.err_at(combo, format!("привязка мыши «{combo}»: {e}")),
         }
     }
-    drag
+    table
+        .into_iter()
+        .filter_map(|((mods, button), a)| {
+            a.map(|action| MouseBinding {
+                mods,
+                button,
+                action,
+            })
+        })
+        .collect()
+}
+
+fn ranged(v: Option<f64>, name: &str, def: f64, min: f64, max: f64, cx: &mut Ctx) -> f64 {
+    let v = v.unwrap_or(def);
+    if !(min..=max).contains(&v) {
+        cx.err_at(name, format!("{name} = {v} вне диапазона {min}..{max}"));
+    }
+    v
 }
 
 fn pos_int(v: Option<i64>, name: &str, min: i64, max: i64, cx: &mut Ctx) -> Option<i64> {
@@ -438,7 +613,7 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     };
 
     let keys_v = compile_keys(&raw, mod_key, &mut cx);
-    let drag_pan = compile_mouse(&raw, mod_key, &mut cx);
+    let mouse = compile_mouse(&raw, mod_key, &mut cx);
 
     let panic_src = raw
         .windows
@@ -526,10 +701,7 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
         ("drift", n.drift.is_some()),
         ("auto_navigate_on_close", n.auto_navigate_on_close.is_some()),
         ("auto_navigate_on_click", n.auto_navigate_on_click.is_some()),
-        ("nudge_step", n.nudge_step.is_some()),
-        ("resize_step", n.resize_step.is_some()),
         ("anchors", n.anchors.is_some()),
-        ("edge_pan", n.edge_pan.is_some()),
     ] {
         if set {
             cx.warn_at(name, format!("navigation.{name} пока не поддерживается"));
@@ -553,9 +725,7 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
         }
     }
     for (name, set) in [
-        ("zoom", raw.zoom.is_some()),
         ("background", raw.background.is_some()),
-        ("snap", raw.snap.is_some()),
         ("decorations", raw.decorations.is_some()),
         ("effects", raw.effects.is_some()),
         ("gestures", raw.gestures.is_some()),
@@ -570,6 +740,68 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     if !raw.autostart.is_empty() {
         cx.warn_at("autostart", "autostart пока не поддерживается");
     }
+
+    let nudge_step = ranged(n.nudge_step, "nudge_step", 20.0, 1.0, 2000.0, &mut cx);
+    let resize_step = ranged(n.resize_step, "resize_step", 20.0, 1.0, 2000.0, &mut cx);
+    let ep = &n.edge_pan;
+    let edge_pan = EdgePan {
+        zone: ranged(ep.zone, "zone", 100.0, 10.0, 500.0, &mut cx),
+        speed_min: ranged(ep.speed_min, "speed_min", 4.0, 0.5, 100.0, &mut cx),
+        speed_max: ranged(ep.speed_max, "speed_max", 10.0, 0.5, 200.0, &mut cx),
+        cursor_pan: ep.cursor_pan.unwrap_or(false),
+        cursor_zone: ranged(ep.cursor_zone, "cursor_zone", 20.0, 1.0, 200.0, &mut cx),
+        latency_ms: pos_int(ep.latency_ms, "latency_ms", 0, 2000, &mut cx).unwrap_or(120) as u64,
+    };
+    if edge_pan.speed_min > edge_pan.speed_max {
+        cx.err_at("speed_min", "speed_min не может быть больше speed_max");
+    }
+    let sn = &raw.snap;
+    let snap = SnapCfg {
+        enabled: sn.enabled.unwrap_or(true),
+        gap: ranged(sn.gap, "gap", 12.0, 0.0, 200.0, &mut cx),
+        outer_gap: ranged(sn.outer_gap, "outer_gap", 12.0, 0.0, 500.0, &mut cx),
+        distance: ranged(sn.distance, "distance", 24.0, 0.0, 200.0, &mut cx),
+        break_force: ranged(sn.break_force, "break_force", 32.0, 0.0, 500.0, &mut cx),
+        corners: sn.corners.unwrap_or(true),
+        centers: sn.centers.unwrap_or(false),
+    };
+    let fit_padding = ranged(
+        raw.zoom.fit_padding,
+        "fit_padding",
+        80.0,
+        0.0,
+        1000.0,
+        &mut cx,
+    );
+    for k in raw.zoom.rest.keys() {
+        cx.warn_at(k, format!("zoom.{k} пока не поддерживается"));
+    }
+    let hc = &raw.hot_corners;
+    let corner = |v: &Option<String>, name: &str, cx: &mut Ctx| -> Option<Action> {
+        let src = v.as_deref()?;
+        match parse_action(src) {
+            Ok(ParsedAction::Action(a)) => Some(a),
+            Ok(ParsedAction::None) => None,
+            Ok(ParsedAction::Unsupported(n)) => {
+                cx.warn_at(
+                    name,
+                    format!("действие «{n}» пока не поддерживается, угол {name} пропущен"),
+                );
+                None
+            }
+            Err(e) => {
+                cx.err_at(name, format!("угол {name}: {e}"));
+                None
+            }
+        }
+    };
+    let hot_corners = HotCorners {
+        threshold: pos_int(hc.threshold, "threshold", 1, 50, &mut cx).unwrap_or(4) as i32,
+        top_left: corner(&hc.top_left, "top_left", &mut cx),
+        top_right: corner(&hc.top_right, "top_right", &mut cx),
+        bottom_left: corner(&hc.bottom_left, "bottom_left", &mut cx),
+        bottom_right: corner(&hc.bottom_right, "bottom_right", &mut cx),
+    };
 
     let mut rules = Vec::new();
     for (i, r) in raw.window_rules.iter().enumerate() {
@@ -620,6 +852,9 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             mod_key,
             windows,
             navigation: Navigation {
+                nudge_step,
+                resize_step,
+                edge_pan,
                 pan_step,
                 camera_speed,
                 mouse_speed,
@@ -629,9 +864,12 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             bindings: Bindings {
                 keys: keys_v,
                 panic,
-                drag_pan,
+                mouse,
             },
             rules,
+            snap,
+            fit_padding,
+            hot_corners,
         },
         warnings: cx.warnings,
     })
@@ -701,7 +939,21 @@ mod tests {
         );
         assert_eq!(find(&c, WIN_CTRL, vk('c')), Some(Action::CenterWindow));
         assert_eq!(find(&c, WIN_CTRL, 0x33), Some(Action::GoToBookmark(3)));
-        assert_eq!(c.bindings.drag_pan, Some(WIN_CTRL));
+        assert!(c.bindings.mouse.iter().any(|b| b.mods == WIN_CTRL
+            && b.button == MouseButton::Left
+            && b.action == MouseAction::Drag(DragKind::Pan)));
+        assert_eq!(c.snap, SnapCfg::default());
+        assert_eq!(
+            find(
+                &c,
+                Mods {
+                    win: true,
+                    ..Default::default()
+                },
+                vk('f')
+            ),
+            Some(Action::ToggleFullscreen)
+        );
         assert_eq!(c.bindings.panic.1, vk('r'));
         assert_eq!(c.navigation.pan_step, 100.0);
     }
@@ -728,7 +980,7 @@ mod tests {
         let src = "[bindings]\ndisable_defaults = [\"keys\", \"mouse\"]\n[keybindings]\n\"mod+ctrl+z\" = \"home-toggle\"\n";
         let c = parse(src).unwrap().config;
         assert_eq!(c.bindings.keys.len(), 1);
-        assert_eq!(c.bindings.drag_pan, None);
+        assert!(c.bindings.mouse.is_empty());
     }
 
     #[test]
@@ -750,12 +1002,12 @@ mod tests {
 
     #[test]
     fn unknown_keys_warn_and_unsupported_warn() {
-        let src = "colour = 1\n[navigation]\npan_stp = 5\nnudge_step = 20\n[keybindings]\n\"mod+ctrl+z\" = \"zoom-in\"\n";
+        let src = "colour = 1\n[navigation]\npan_stp = 5\nanchors = []\n[keybindings]\n\"mod+ctrl+z\" = \"zoom-in\"\n";
         let l = parse(src).unwrap();
         let w = l.warnings.join("\n");
         assert!(w.contains("colour"), "{w}");
         assert!(w.contains("pan_stp"), "{w}");
-        assert!(w.contains("nudge_step"), "{w}");
+        assert!(w.contains("anchors"), "{w}");
         assert!(w.contains("zoom-in"), "{w}");
     }
 
@@ -820,7 +1072,107 @@ mod tests {
             alt: true,
             ..Default::default()
         };
-        assert_eq!(c.bindings.drag_pan, Some(m));
+        assert!(c.bindings.mouse.iter().any(|b| b.mods == m
+            && b.button == MouseButton::Left
+            && b.action == MouseAction::Drag(DragKind::Pan)));
+    }
+
+    #[test]
+    fn default_mouse_has_move_resize_fit_fill() {
+        let c = Config::default();
+        let find_m = |mods: Mods, b: MouseButton| {
+            c.bindings
+                .mouse
+                .iter()
+                .find(|x| x.mods == mods && x.button == b)
+                .map(|x| x.action)
+        };
+        let alt = Mods {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            find_m(alt, MouseButton::Left),
+            Some(MouseAction::Drag(DragKind::MoveWindow))
+        );
+        assert_eq!(
+            find_m(Mods { shift: true, ..alt }, MouseButton::Left),
+            Some(MouseAction::Drag(DragKind::MoveCluster))
+        );
+        assert_eq!(
+            find_m(alt, MouseButton::Right),
+            Some(MouseAction::Drag(DragKind::ResizeCluster))
+        );
+        assert_eq!(
+            find_m(alt, MouseButton::Middle),
+            Some(MouseAction::Click(Action::FitWindowSnapped))
+        );
+        let win = Mods {
+            win: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            find_m(win, MouseButton::Middle),
+            Some(MouseAction::Click(Action::FillWindow))
+        );
+    }
+
+    #[test]
+    fn mouse_combo_needs_win_or_alt_and_known_button() {
+        assert!(parse("[mouse.anywhere]\n\"ctrl+left\" = \"move-window\"\n").is_err());
+        assert!(parse("[mouse.anywhere]\n\"alt+back\" = \"move-window\"\n").is_err());
+        assert!(parse("[mouse.anywhere]\n\"alt+right\" = \"resize-window\"\n").is_ok());
+    }
+
+    #[test]
+    fn snap_edge_pan_and_hot_corners_are_parsed_and_validated() {
+        let src = r#"
+[snap]
+gap = 20
+distance = 30
+centers = true
+[navigation]
+nudge_step = 50
+[navigation.edge_pan]
+zone = 150
+cursor_pan = true
+[zoom]
+fit_padding = 40
+[hot_corners]
+threshold = 6
+top_left = "home-toggle"
+bottom_right = "none"
+"#;
+        let l = parse(src).unwrap();
+        let c = l.config;
+        assert_eq!(c.snap.gap, 20.0);
+        assert!(c.snap.centers && c.snap.corners);
+        assert_eq!(c.navigation.nudge_step, 50.0);
+        assert_eq!(c.navigation.edge_pan.zone, 150.0);
+        assert!(c.navigation.edge_pan.cursor_pan);
+        assert_eq!(c.fit_padding, 40.0);
+        assert_eq!(c.hot_corners.threshold, 6);
+        assert_eq!(c.hot_corners.top_left, Some(Action::HomeToggle));
+        assert_eq!(c.hot_corners.bottom_right, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(parse("[snap]\ngap = -1\n").is_err());
+        assert!(parse("[navigation.edge_pan]\nspeed_min = 20\nspeed_max = 5\n").is_err());
+        assert!(parse("[hot_corners]\ntop_left = \"fly\"\n").is_err());
+        let w = parse("[zoom]\nstep = 1.2\n").unwrap().warnings.join("\n");
+        assert!(w.contains("zoom.step"), "{w}");
+    }
+
+    #[test]
+    fn new_actions_parse() {
+        assert_eq!(
+            parse_action("move-to-snap left"),
+            Ok(ParsedAction::Action(Action::MoveToSnap(Dir::Left)))
+        );
+        assert_eq!(
+            parse_action("fill-window"),
+            Ok(ParsedAction::Action(Action::FillWindow))
+        );
+        assert!(parse_action("grow-window").is_err());
     }
 
     #[test]

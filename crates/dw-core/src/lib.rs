@@ -3,8 +3,9 @@
 pub mod action;
 pub mod canvas;
 pub mod nav;
+pub mod snap;
 
-use std::ops::{Add, Sub};
+use std::ops::{Add, Mul, Sub};
 
 /// Стабильный идентификатор окна DriftWin (не HWND).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,6 +40,13 @@ impl Add for Vec2 {
     type Output = Vec2;
     fn add(self, o: Vec2) -> Vec2 {
         Vec2::new(self.x + o.x, self.y + o.y)
+    }
+}
+
+impl Mul<f64> for Vec2 {
+    type Output = Vec2;
+    fn mul(self, k: f64) -> Vec2 {
+        Vec2::new(self.x * k, self.y * k)
     }
 }
 

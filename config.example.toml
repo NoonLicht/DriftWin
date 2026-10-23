@@ -15,8 +15,37 @@ camera_speed = 0.3           # доля пути, проходимая каме�
 mouse_speed = 1.0            # множитель перетаскивания холста мышью
 auto_navigate = true         # при смене фокуса на окно вне экрана камера подходит к нему
 
+nudge_step = 20              # nudge-window, px
+resize_step = 20             # grow-window / shrink-window, px
+
+[navigation.edge_pan]
+zone = 100                   # ширина зоны у края при перетаскивании окна
+speed_min = 4                # px за кадр (при 60 fps) на границе зоны
+speed_max = 10               # и у самого края
+cursor_pan = false           # крутить вид и просто курсором у края (toggle-cursor-pan)
+cursor_zone = 20
+latency_ms = 120
+
 [navigation.bookmarks]
 "1" = [0, 0]
+
+[snap]
+enabled = true
+gap = 12                     # зазор между привязанными окнами
+outer_gap = 12               # отступ от края вида при fill-window
+distance = 24                # на каком расстоянии срабатывает притяжка
+break_force = 32             # насколько надо дёрнуть, чтобы отлипнуть
+corners = true               # выравнивать края соседних окон
+centers = false              # выравнивать центры
+
+[zoom]
+fit_padding = 80             # отступ при fit-window
+
+# Горячие углы основного монитора: любое действие. Выключено, пока углы не заданы.
+[hot_corners]
+threshold = 4
+# top_left = "home-toggle"
+# top_right = "focus-center"
 
 [bindings]
 disable_defaults = []        # "keys", "mouse" — отключить стандартные привязки
@@ -26,9 +55,13 @@ disable_defaults = []        # "keys", "mouse" — отключить станд
 "mod+ctrl+right" = "pan-viewport right"
 "mod+ctrl+q" = "quit"
 "mod+ctrl+h" = "none"
+# "mod+alt+shift+right" = "nudge-window right"
 
 [mouse.anywhere]
-"mod+ctrl+left" = "pan-viewport"
+"mod+ctrl+left" = "pan-viewport"          # перетаскивание холста
+# "alt+left" = "move-window"               # стандартно; Alt+Shift+ЛКМ — вместе с кластером
+# "alt+right" = "resize-window-snapped"    # стандартно; Alt+Shift+ПКМ — только это окно
+# "alt+middle" = "fit-window-snapped"      # стандартно; Alt+Shift+СКМ — fit-window; mod+СКМ — fill-window
 
 [[window_rules]]
 app_id = "notepad.exe"       # exe без учёта регистра; можно class = "...", title = "*glob*" или "/regex/"

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{Dir, ScreenRect, Vec2, Viewport, WindowId};
+use crate::{Dir, Rect, ScreenRect, Vec2, Viewport, WindowId};
 
 pub struct Canvas {
     pub viewport: Viewport,
@@ -112,6 +112,46 @@ impl Canvas {
     /// Центр окна в мире.
     pub fn window_center(&self, id: WindowId) -> Option<Vec2> {
         self.windows.get(&id).map(|(c, _)| *c)
+    }
+
+    /// Прямоугольник окна в мире (центр и размер).
+    pub fn rect(&self, id: WindowId) -> Option<Rect> {
+        self.windows.get(&id).map(|(c, sz)| Rect {
+            center: *c,
+            w: sz.0 as f64,
+            h: sz.1 as f64,
+        })
+    }
+
+    /// Положить окно в мировой прямоугольник (размер округляется до пикселей).
+    pub fn set_rect(&mut self, id: WindowId, r: Rect) {
+        if let Some(w) = self.windows.get_mut(&id) {
+            *w = (r.center, (r.w.round() as i32, r.h.round() as i32));
+        }
+    }
+
+    /// Окна, с которыми работают привязка и кластеры: на холсте, не закреплённые и не виджеты.
+    pub fn snap_items(&self) -> Vec<(WindowId, Rect)> {
+        self.navigable()
+            .filter_map(|id| self.rect(id).map(|r| (id, r)))
+            .collect()
+    }
+
+    /// Видимая область в мире.
+    pub fn view_rect(&self) -> Rect {
+        Rect {
+            center: self.viewport.center,
+            w: self.viewport.size_px.0 as f64 / self.viewport.zoom,
+            h: self.viewport.size_px.1 as f64 / self.viewport.zoom,
+        }
+    }
+
+    /// Точка на экране (координаты виртуального рабочего стола) -> мир.
+    pub fn screen_point_to_world(&self, x: i32, y: i32) -> Vec2 {
+        self.viewport.screen_to_world(Vec2::new(
+            (x - self.origin.0) as f64,
+            (y - self.origin.1) as f64,
+        ))
     }
 
     /// Окна, участвующие в навигации (не закреплённые и не виджеты).
