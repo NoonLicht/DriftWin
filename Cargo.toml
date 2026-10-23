@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dw-core",
+    "crates/dw-win",
+    "crates/dw-render",
+    "crates/dw-input",
+    "crates/dw-ipc",
+    "crates/dw-config",
+    "apps/driftwin",
+    "apps/driftwinctl",
+    "apps/driftwin-guard",
+    "apps/driftwin-settings",
+    "prototypes",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["David Gadzhimagomedov"]
+
+[workspace.dependencies]
+windows = "0.62"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+dw-core = { path = "crates/dw-core" }
+dw-win = { path = "crates/dw-win" }
+dw-render = { path = "crates/dw-render" }
+dw-input = { path = "crates/dw-input" }
+dw-ipc = { path = "crates/dw-ipc" }
+dw-config = { path = "crates/dw-config" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
