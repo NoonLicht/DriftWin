@@ -1,4 +1,4 @@
-//! Демон DriftWin, Этап 1: камера по Mod+Ctrl+стрелки для окон из белого списка.
+//! Демон DriftWin, Этапы 1–2: камера и навигация для окон из белого списка.
 //!
 //! Безопасность: без `--only` или `--all` не запускается; при выходе и по аварийной клавише
 //! (Win+Ctrl+Shift+R) окна возвращаются на исходные места; страж возвращает их после падения.
@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use dw_core::{WindowId, canvas::Canvas};
-use dw_input::{Dir, Input};
+use dw_core::nav::{Inertia, Mru, VelocityTracker};
+use dw_core::{Dir, Vec2, WindowId, canvas::Canvas};
+use dw_input::Input;
 use dw_win::{Baseline, Filter, Managed};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
@@ -25,6 +26,8 @@ use windows::core::w;
 
 const PAN_STEP: f64 = 100.0;
 const CAMERA_LERP: f64 = 0.3;
+/// Через сколько без нажатий переключатель MRU фиксирует выбор.
+const CYCLE_COMMIT: Duration = Duration::from_millis(1500);
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -41,12 +44,28 @@ unsafe extern "system" fn ctrl_handler(ev: u32) -> windows::core::BOOL {
 struct Opts {
     filter: Filter,
     state_dir: PathBuf,
+    /// Имена exe (нижний регистр), закреплённые на экране.
+    pinned: Vec<String>,
+    /// Имена exe, закреплённые и исключённые из навигации.
+    widgets: Vec<String>,
+    auto_navigate: bool,
+}
+
+fn exe_list(v: Option<String>) -> Vec<String> {
+    v.unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn parse_args() -> Result<Opts> {
     let mut only = None;
     let mut all = false;
     let mut dir = None;
+    let mut pinned = vec![];
+    let mut widgets = vec![];
+    let mut auto_navigate = true;
     let mut a = std::env::args().skip(1);
     while let Some(x) = a.next() {
         match x.as_str() {
@@ -60,6 +79,9 @@ fn parse_args() -> Result<Opts> {
                 );
             }
             "--all" => all = true,
+            "--pinned" => pinned = exe_list(a.next()),
+            "--widget" => widgets = exe_list(a.next()),
+            "--no-auto-navigate" => auto_navigate = false,
             "--state-dir" => dir = a.next().map(PathBuf::from),
             other => bail!("неизвестный аргумент {other}"),
         }
@@ -78,6 +100,9 @@ fn parse_args() -> Result<Opts> {
             only: if all { None } else { only },
         },
         state_dir,
+        pinned,
+        widgets,
+        auto_navigate,
     })
 }
 
@@ -103,8 +128,22 @@ struct App {
     baseline: Arc<Mutex<Baseline>>,
     baseline_path: PathBuf,
     filter: Filter,
-    target: dw_core::Vec2,
+    target: Vec2,
     last_move: Instant,
+    pinned: Vec<String>,
+    widgets: Vec<String>,
+    auto_navigate: bool,
+    inertia: Inertia,
+    tracker: VelocityTracker,
+    mru: Mru,
+    bookmarks: HashMap<u8, Vec2>,
+    epoch: Instant,
+    last_tick: Instant,
+    /// Положение камеры, для которого окна были расставлены в последний раз.
+    applied: Vec2,
+    /// Последнее увиденное окно в фокусе (чтобы реагировать только на смену).
+    fg_seen: Option<WindowId>,
+    last_cycle: Option<Instant>,
 }
 
 impl App {
@@ -129,6 +168,12 @@ impl App {
             self.canvas.adopt(m.id, m.visible);
             self.last.insert(m.id, m.visible);
             let home = self.canvas.home_rect(m.id).unwrap_or(m.visible);
+            let exe = m.exe.to_lowercase();
+            if self.widgets.contains(&exe) {
+                self.canvas.pin(m.id, m.visible, true);
+            } else if self.pinned.contains(&exe) {
+                self.canvas.pin(m.id, m.visible, false);
+            }
             tracing::info!("взято под управление: {} «{}»", m.exe, m.title);
             {
                 let mut b = self.baseline.lock().unwrap();
@@ -150,6 +195,7 @@ impl App {
         for id in dead {
             self.managed.remove(&id);
             self.canvas.forget(id);
+            self.mru.remove(id);
             self.last.remove(&id);
         }
         for s in skipped {
@@ -163,27 +209,45 @@ impl App {
         self.target = self.canvas.viewport.center;
         self.managed.clear();
         self.last.clear();
+        self.inertia.stop();
+        self.mru = Mru::default();
+        self.applied = self.canvas.viewport.center;
+    }
+
+    fn now_secs(&self) -> f64 {
+        self.epoch.elapsed().as_secs_f64()
     }
 
     fn tick(&mut self) {
-        let c = self.canvas.viewport.center;
-        let d = self.target - c;
-        if d.x == 0.0 && d.y == 0.0 {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
+        self.last_tick = now;
+        if self.inertia.active() {
+            let d = self.inertia.step(dt);
+            let c = self.canvas.viewport.center;
+            self.canvas.viewport.center = Vec2::new(c.x + d.x, c.y + d.y);
+            self.target = self.canvas.viewport.center;
+        } else {
+            let c = self.canvas.viewport.center;
+            let d = self.target - c;
+            if d.x != 0.0 || d.y != 0.0 {
+                if d.x.abs() < 0.5 && d.y.abs() < 0.5 {
+                    self.canvas.viewport.center = self.target;
+                } else {
+                    self.canvas.viewport.center =
+                        Vec2::new(c.x + d.x * CAMERA_LERP, c.y + d.y * CAMERA_LERP);
+                }
+            }
+        }
+        if self.canvas.viewport.center == self.applied {
             return;
         }
-        let (mx, my) = if d.x.abs() < 0.5 && d.y.abs() < 0.5 {
-            (d.x, d.y)
-        } else {
-            (d.x * CAMERA_LERP, d.y * CAMERA_LERP)
-        };
-        self.last_move = Instant::now();
-        self.canvas.viewport.center = dw_core::Vec2::new(c.x + mx, c.y + my);
-        if d.x.abs() < 0.5 && d.y.abs() < 0.5 {
-            self.canvas.viewport.center = self.target;
-        }
+        self.applied = self.canvas.viewport.center;
+        self.last_move = now;
         let layout = self.canvas.layout();
         let items: Vec<_> = layout
             .iter()
+            .filter(|(id, _)| !self.canvas.is_pinned(*id))
             .filter_map(|(id, r)| {
                 self.managed
                     .get(id)
@@ -194,6 +258,130 @@ impl App {
         dw_win::apply(&items);
         for (m, r) in items {
             self.last.insert(m.id, r);
+        }
+    }
+
+    /// Окно в фокусе, если оно под управлением и участвует в навигации.
+    fn focused_nav(&self) -> Option<WindowId> {
+        let id = dw_win::foreground()?;
+        (self.managed.contains_key(&id) && !self.canvas.is_pinned(id)).then_some(id)
+    }
+
+    /// Подвести камеру к окну.
+    fn center_on(&mut self, id: WindowId) {
+        if let Some(c) = self.canvas.window_center(id) {
+            self.inertia.stop();
+            self.target = c;
+        }
+    }
+
+    /// Дать фокус окну и подвести к нему камеру.
+    fn go_to(&mut self, id: WindowId) {
+        if let Some(m) = self.managed.get(&id) {
+            if !dw_win::focus(m) {
+                tracing::warn!("фокус на «{}» не получен (ОС отказала)", m.title);
+            }
+            self.fg_seen = Some(id);
+        }
+        self.center_on(id);
+    }
+
+    /// Реакция на смену окна в фокусе: MRU и автонавигация к окну вне экрана.
+    fn track_focus(&mut self) {
+        let fg = dw_win::foreground();
+        if fg == self.fg_seen {
+            return;
+        }
+        self.fg_seen = fg;
+        let Some(id) = fg.filter(|id| self.managed.contains_key(id)) else {
+            return;
+        };
+        if self.canvas.is_pinned(id) {
+            return;
+        }
+        self.mru.touch(id);
+        if self.auto_navigate
+            && let Some(r) = self.canvas.screen_rect(id)
+        {
+            let (ox, oy) = self.canvas.origin;
+            let (w, h) = self.canvas.viewport.size_px;
+            let inside =
+                r.x >= ox && r.y >= oy && r.x + r.w <= ox + w as i32 && r.y + r.h <= oy + h as i32;
+            if !inside {
+                self.center_on(id);
+            }
+        }
+    }
+
+    fn handle(&mut self, ev: Input) {
+        match ev {
+            Input::Pan(d) => {
+                self.inertia.stop();
+                match d {
+                    Dir::Left => self.target.x -= PAN_STEP,
+                    Dir::Right => self.target.x += PAN_STEP,
+                    Dir::Up => self.target.y += PAN_STEP,
+                    Dir::Down => self.target.y -= PAN_STEP,
+                }
+            }
+            Input::Drag { dx, dy } => {
+                self.inertia.stop();
+                self.canvas.pan_px(-(dx as f64), -(dy as f64));
+                self.target = self.canvas.viewport.center;
+                self.tracker
+                    .push(self.now_secs(), Vec2::new(-(dx as f64), dy as f64));
+            }
+            Input::DragEnd => {
+                let v = self.tracker.velocity(self.now_secs());
+                self.tracker.clear();
+                self.inertia.fling(v);
+            }
+            Input::Focus(d) => {
+                let skip = self.focused_nav();
+                let from = skip
+                    .and_then(|id| self.canvas.window_center(id))
+                    .unwrap_or(self.canvas.viewport.center);
+                if let Some(id) = self.canvas.nearest(from, skip, d) {
+                    self.mru.touch(id);
+                    self.go_to(id);
+                }
+            }
+            Input::Cycle(fwd) => {
+                if let Some(id) = self.mru.cycle(fwd) {
+                    self.last_cycle = Some(Instant::now());
+                    self.go_to(id);
+                }
+            }
+            Input::Center => {
+                if let Some(id) = self.focused_nav() {
+                    self.center_on(id);
+                }
+            }
+            Input::Home => {
+                self.inertia.stop();
+                self.target = self.canvas.home();
+            }
+            Input::BookmarkSet(n) => {
+                self.bookmarks.insert(n, self.canvas.viewport.center);
+                tracing::info!("закладка {n} сохранена");
+            }
+            Input::BookmarkGo(n) => {
+                if let Some(p) = self.bookmarks.get(&n).copied() {
+                    self.inertia.stop();
+                    self.target = p;
+                }
+            }
+            Input::Panic => {}
+        }
+    }
+
+    /// Периодические дела: фиксация выбора MRU-переключателя.
+    fn housekeeping(&mut self) {
+        if let Some(t) = self.last_cycle
+            && t.elapsed() > CYCLE_COMMIT
+        {
+            self.mru.commit();
+            self.last_cycle = None;
         }
     }
 }
@@ -284,10 +472,22 @@ fn main() -> Result<()> {
         filter: opts.filter,
         target,
         last_move: Instant::now(),
+        pinned: opts.pinned,
+        widgets: opts.widgets,
+        auto_navigate: opts.auto_navigate,
+        inertia: Inertia::default(),
+        tracker: VelocityTracker::default(),
+        mru: Mru::default(),
+        bookmarks: HashMap::new(),
+        epoch: Instant::now(),
+        last_tick: Instant::now(),
+        applied: target,
+        fg_seen: dw_win::foreground(),
+        last_cycle: None,
     };
     app.rescan();
     tracing::info!(
-        "готово: окон под управлением {}, монитор {w}x{h}. Win+Ctrl+стрелки — камера, Win+Ctrl+Shift+R — аварийный возврат",
+        "готово: окон под управлением {}, монитор {w}x{h}. Win+Ctrl+стрелки/мышь — камера, Win+Alt+стрелки — фокус, Win+Ctrl+Tab — MRU, Win+Ctrl+C/H — центр/дом, Win+Ctrl+[Shift+]1..9 — закладки, Win+Ctrl+Shift+R — аварийный возврат",
         app.canvas.len()
     );
 
@@ -324,19 +524,14 @@ fn main() -> Result<()> {
             }
         }
         while let Ok(ev) = rx.try_recv() {
-            if let Input::Pan(d) = ev
-                && !is_paused
-            {
-                match d {
-                    Dir::Left => app.target.x -= PAN_STEP,
-                    Dir::Right => app.target.x += PAN_STEP,
-                    Dir::Up => app.target.y += PAN_STEP,
-                    Dir::Down => app.target.y -= PAN_STEP,
-                }
+            if !is_paused {
+                app.handle(ev);
             }
         }
         if !is_paused {
+            app.track_focus();
             app.tick();
+            app.housekeeping();
             if Instant::now() >= next_scan {
                 app.rescan();
                 next_scan = Instant::now() + Duration::from_secs(1);

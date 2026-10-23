@@ -1,6 +1,7 @@
 //! Чистая логика DriftWin без Win32: холст, камера, геометрия, трейт `Platform`.
 
 pub mod canvas;
+pub mod nav;
 
 use std::ops::{Add, Sub};
 
@@ -10,6 +11,15 @@ pub struct WindowId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MonitorId(pub u64);
+
+/// Направление на экране.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
 
 /// Точка/вектор. В мире Y направлена вверх.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

@@ -14,6 +14,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
+    VK_MENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PWSTR;
 
@@ -258,6 +262,51 @@ pub fn current_visible(m: &Managed) -> Option<ScreenRect> {
 pub fn is_minimized_or_maximized(m: &Managed) -> bool {
     let h = hwnd_of(m.id);
     unsafe { IsIconic(h).as_bool() || IsZoomed(h).as_bool() }
+}
+
+/// Окно, которое сейчас в фокусе.
+pub fn foreground() -> Option<WindowId> {
+    let h = unsafe { GetForegroundWindow() };
+    (!h.0.is_null()).then_some(WindowId(h.0 as usize as u64))
+}
+
+/// Отметка для собственных синтетических нажатий (хук их игнорирует; Alt-тап не должен ничего запускать).
+const FOCUS_MAGIC: usize = 0xD21F7;
+
+fn alt_tap() {
+    let k = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_MENU,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                dwExtraInfo: FOCUS_MAGIC,
+                ..Default::default()
+            },
+        },
+    };
+    unsafe { SendInput(&[k(false), k(true)], size_of::<INPUT>() as i32) };
+}
+
+/// Передать фокус окну. Сначала обычный `SetForegroundWindow`; если ОС отказала —
+/// Alt-тап (даёт процессу право на смену foreground) и повтор. Возвращает, получилось ли.
+pub fn focus(m: &Managed) -> bool {
+    let h = hwnd_of(m.id);
+    unsafe {
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+        if GetForegroundWindow() != h {
+            alt_tap();
+            let _ = SetForegroundWindow(h);
+        }
+        GetForegroundWindow() == h
+    }
 }
 
 /// Пределы «парковки»: некоторые приложения хранят 16-битные координаты (см. отчёт Этапа 0).
