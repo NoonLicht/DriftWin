@@ -52,6 +52,9 @@ static CTRL: AtomicBool = AtomicBool::new(false);
 static SHIFT: AtomicBool = AtomicBool::new(false);
 static ALT: AtomicBool = AtomicBool::new(false);
 static SWALLOWED: AtomicBool = AtomicBool::new(false);
+/// Alt участвовал в перехваченной комбинации: при отпускании маскируем его, иначе приложение
+/// воспримет это как одиночное нажатие Alt и покажет подсказки меню.
+static ALT_SWALLOWED: AtomicBool = AtomicBool::new(false);
 
 static DRAG: AtomicBool = AtomicBool::new(false);
 static LAST_X: AtomicI32 = AtomicI32::new(0);
@@ -156,7 +159,13 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 }
                 VK_LCONTROL | VK_RCONTROL | VK_CONTROL => CTRL.store(!up, SeqCst),
                 VK_LSHIFT | VK_RSHIFT | VK_SHIFT => SHIFT.store(!up, SeqCst),
-                VK_LMENU | VK_RMENU | VK_MENU => ALT.store(!up, SeqCst),
+                VK_LMENU | VK_RMENU | VK_MENU => {
+                    ALT.store(!up, SeqCst);
+                    if up && ALT_SWALLOWED.swap(false, SeqCst) {
+                        let i = [kb(MASK_VK, false), kb(MASK_VK, true)];
+                        unsafe { SendInput(&i, size_of::<INPUT>() as i32) };
+                    }
+                }
                 key if WIN.load(SeqCst) => {
                     let (ctrl, shift, alt) =
                         (CTRL.load(SeqCst), SHIFT.load(SeqCst), ALT.load(SeqCst));
@@ -175,6 +184,9 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         && let Some(i) = map_key(vk, ctrl, shift, alt)
                     {
                         SWALLOWED.store(true, SeqCst);
+                        if alt {
+                            ALT_SWALLOWED.store(true, SeqCst);
+                        }
                         if !up {
                             send(i);
                         }

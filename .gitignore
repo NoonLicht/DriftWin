@@ -1,3 +1,5 @@
 /target
 *.log
 baseline.json
+/ffmpeg.exe
+/ffprobe.exe

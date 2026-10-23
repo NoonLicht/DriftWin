@@ -16,7 +16,7 @@ use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VK_MENU,
+    VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PWSTR;
@@ -273,12 +273,15 @@ pub fn foreground() -> Option<WindowId> {
 /// Отметка для собственных синтетических нажатий (хук их игнорирует; Alt-тап не должен ничего запускать).
 const FOCUS_MAGIC: usize = 0xD21F7;
 
-fn alt_tap() {
+/// Нажатие неиспользуемой клавиши: считается вводом процесса (даёт право сменить foreground),
+/// но, в отличие от Alt, не включает режим меню/подсказок в приложениях.
+fn input_tap() {
+    const UNASSIGNED_VK: u16 = 0xE8;
     let k = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VK_MENU,
+                wVk: VIRTUAL_KEY(UNASSIGNED_VK),
                 dwFlags: if up {
                     KEYEVENTF_KEYUP
                 } else {
@@ -293,7 +296,7 @@ fn alt_tap() {
 }
 
 /// Передать фокус окну. Сначала обычный `SetForegroundWindow`; если ОС отказала —
-/// Alt-тап (даёт процессу право на смену foreground) и повтор. Возвращает, получилось ли.
+/// нейтральное нажатие клавиши (даёт процессу право на смену foreground) и повтор. Возвращает, получилось ли.
 pub fn focus(m: &Managed) -> bool {
     let h = hwnd_of(m.id);
     unsafe {
@@ -302,7 +305,7 @@ pub fn focus(m: &Managed) -> bool {
         }
         let _ = SetForegroundWindow(h);
         if GetForegroundWindow() != h {
-            alt_tap();
+            input_tap();
             let _ = SetForegroundWindow(h);
         }
         GetForegroundWindow() == h
