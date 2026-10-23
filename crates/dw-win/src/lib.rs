@@ -317,7 +317,6 @@ pub fn apply(items: &[(&Managed, ScreenRect)]) {
     let flags = SWP_NOACTIVATE
         | SWP_NOZORDER
         | SWP_NOOWNERZORDER
-        | SWP_NOCOPYBITS
         | SWP_NOSIZE
         | SWP_NOSENDCHANGING
         | SWP_ASYNCWINDOWPOS;
@@ -327,6 +326,18 @@ pub fn apply(items: &[(&Managed, ScreenRect)]) {
         unsafe {
             let _ = SetWindowPos(hwnd_of(m.id), None, x, y, 0, 0, flags);
         }
+    }
+}
+
+/// Виртуальный рабочий стол (все мониторы): (x, y, ширина, высота).
+pub fn virtual_screen() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
     }
 }
 

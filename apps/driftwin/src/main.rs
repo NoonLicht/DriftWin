@@ -41,6 +41,10 @@ unsafe extern "system" fn ctrl_handler(ev: u32) -> windows::core::BOOL {
     false.into()
 }
 
+fn on_desktop(r: &dw_core::ScreenRect, vs: (i32, i32, i32, i32)) -> bool {
+    r.x < vs.0 + vs.2 && r.x + r.w > vs.0 && r.y < vs.1 + vs.3 && r.y + r.h > vs.1
+}
+
 struct Opts {
     filter: Filter,
     state_dir: PathBuf,
@@ -244,10 +248,17 @@ impl App {
         }
         self.applied = self.canvas.viewport.center;
         self.last_move = now;
+        let vs = dw_win::virtual_screen();
         let layout = self.canvas.layout();
         let items: Vec<_> = layout
             .iter()
             .filter(|(id, _)| !self.canvas.is_pinned(*id))
+            // окно было и остаётся за пределами экранов — не трогаем (меньше работы для DWM и приложений)
+            .filter(|(id, r)| {
+                self.last
+                    .get(id)
+                    .is_none_or(|p| on_desktop(p, vs) || on_desktop(r, vs))
+            })
             .filter_map(|(id, r)| {
                 self.managed
                     .get(id)
