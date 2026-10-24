@@ -439,6 +439,7 @@ name = "driftwin-settings"
 version = "0.0.1"
 dependencies = [
  "dw-config",
+ "dw-win",
  "eframe",
  "toml_edit",
 ]

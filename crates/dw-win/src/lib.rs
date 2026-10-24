@@ -10,7 +10,8 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MONITORINFOEXW, MonitorFromPoint,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::*;
@@ -435,6 +436,131 @@ pub fn primary_monitor() -> (i32, i32, u32, u32) {
             (r.right - r.left) as u32,
             (r.bottom - r.top) as u32,
         )
+    }
+}
+
+/// Монитор рабочего стола.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorInfo {
+    /// Имя устройства без префикса: `DISPLAY1`.
+    pub name: String,
+    /// Прямоугольник: (x, y, ширина, высота) в координатах виртуального рабочего стола.
+    pub rect: (i32, i32, i32, i32),
+    pub primary: bool,
+}
+
+unsafe extern "system" fn monitor_cb(
+    mon: HMONITOR,
+    _: HDC,
+    _: *mut RECT,
+    lp: LPARAM,
+) -> windows::core::BOOL {
+    let out = unsafe { &mut *(lp.0 as *mut Vec<MonitorInfo>) };
+    let mut mi = MONITORINFOEXW::default();
+    mi.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    if unsafe { GetMonitorInfoW(mon, &mut mi as *mut _ as *mut MONITORINFO) }.as_bool() {
+        let r = mi.monitorInfo.rcMonitor;
+        let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(0);
+        let name = String::from_utf16_lossy(&mi.szDevice[..n]);
+        out.push(MonitorInfo {
+            name: name.trim_start_matches("\\\\.\\").to_string(),
+            rect: (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            primary: mi.monitorInfo.dwFlags & 1 != 0,
+        });
+    }
+    true.into()
+}
+
+/// Все мониторы, по имени устройства (`DISPLAY1`, `DISPLAY2`, …).
+pub fn monitors() -> Vec<MonitorInfo> {
+    let mut v: Vec<MonitorInfo> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(monitor_cb),
+            LPARAM(&mut v as *mut _ as isize),
+        );
+    }
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+/// Выбрать мониторы по именам из конфига: `primary`, `DISPLAY2`, `2` (= `DISPLAY2`). Пусто или ничего
+/// не найдено — основной монитор.
+pub fn select_monitors(all: &[MonitorInfo], names: &[String]) -> Vec<MonitorInfo> {
+    let want = |m: &MonitorInfo, n: &str| {
+        let n = n.trim().to_lowercase();
+        n == "primary" && m.primary
+            || n == m.name.to_lowercase()
+            || n.parse::<u32>()
+                .is_ok_and(|i| m.name.to_lowercase() == format!("display{i}"))
+    };
+    let mut sel: Vec<MonitorInfo> = all
+        .iter()
+        .filter(|m| names.iter().any(|n| want(m, n)))
+        .cloned()
+        .collect();
+    if sel.is_empty() {
+        sel = all.iter().filter(|m| m.primary).cloned().collect();
+    }
+    if sel.is_empty() {
+        sel = all.first().cloned().into_iter().collect();
+    }
+    sel
+}
+
+/// Прямоугольник, охватывающий все данные мониторы.
+pub fn bounding_rect(mons: &[MonitorInfo]) -> (i32, i32, i32, i32) {
+    let x0 = mons.iter().map(|m| m.rect.0).min().unwrap_or(0);
+    let y0 = mons.iter().map(|m| m.rect.1).min().unwrap_or(0);
+    let x1 = mons.iter().map(|m| m.rect.0 + m.rect.2).max().unwrap_or(0);
+    let y1 = mons.iter().map(|m| m.rect.1 + m.rect.3).max().unwrap_or(0);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    fn m(name: &str, x: i32, y: i32, w: i32, h: i32, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            name: name.into(),
+            rect: (x, y, w, h),
+            primary,
+        }
+    }
+
+    fn setup() -> Vec<MonitorInfo> {
+        vec![
+            m("DISPLAY1", 0, 0, 2752, 1152, true),
+            m("DISPLAY2", 400, -1080, 1920, 1080, false),
+            m("DISPLAY3", 2752, -600, 1080, 1920, false),
+        ]
+    }
+
+    #[test]
+    fn selects_by_name_number_and_primary() {
+        let all = setup();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let n = |s: Vec<MonitorInfo>| s.iter().map(|m| m.name.clone()).collect::<Vec<_>>();
+        assert_eq!(n(select_monitors(&all, &[])), ["DISPLAY1"]);
+        assert_eq!(n(select_monitors(&all, &names(&["primary"]))), ["DISPLAY1"]);
+        assert_eq!(
+            n(select_monitors(&all, &names(&["2", "display3"]))),
+            ["DISPLAY2", "DISPLAY3"]
+        );
+        assert_eq!(
+            n(select_monitors(&all, &names(&["DISPLAY9"]))),
+            ["DISPLAY1"]
+        );
+    }
+
+    #[test]
+    fn bounding_rect_covers_selection() {
+        let all = setup();
+        assert_eq!(bounding_rect(&all[..1]), (0, 0, 2752, 1152));
+        assert_eq!(bounding_rect(&all[..2]), (0, -1080, 2752, 2232));
     }
 }
 

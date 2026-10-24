@@ -117,8 +117,18 @@ pub struct Background {
     pub on_desktop: bool,
 }
 
+/// На каких мониторах работает DriftWin (`[monitors]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Monitors {
+    /// Имена из `use` (нижний регистр); пусто — основной монитор.
+    pub names: Vec<String>,
+    /// Окна не заходят на мониторы вне списка (прячутся, пока перекрывают их).
+    pub isolate: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub monitors: Monitors,
     pub zoom: Zoom,
     pub background: Background,
     pub mod_key: ModKey,
@@ -172,6 +182,7 @@ struct RawConfig {
     window_rules: Vec<rules::RawRule>,
     // секции плана, которые появятся в следующих этапах
     zoom: RawZoom,
+    monitors: RawMonitors,
     background: RawBackground,
     snap: RawSnap,
     hot_corners: RawHotCorners,
@@ -206,6 +217,14 @@ struct RawZoom {
     /// Остальные ключи [zoom] ещё не реализованы.
     #[serde(flatten)]
     rest: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawMonitors {
+    #[serde(rename = "use")]
+    names: Vec<String>,
+    isolate: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -915,6 +934,16 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
         ),
     }
     let background = compile_background(&raw.background, &mut cx);
+    let monitors = Monitors {
+        names: raw
+            .monitors
+            .names
+            .iter()
+            .map(|n| n.trim().trim_start_matches(r"\\.\").to_lowercase())
+            .filter(|n| !n.is_empty())
+            .collect(),
+        isolate: raw.monitors.isolate.unwrap_or(true),
+    };
     let hc = &raw.hot_corners;
     let corner = |v: &Option<String>, name: &str, cx: &mut Ctx| -> Option<Action> {
         let src = v.as_deref()?;
@@ -1011,6 +1040,7 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             hot_corners,
             zoom,
             background,
+            monitors,
         },
         warnings: cx.warnings,
     })
@@ -1302,6 +1332,19 @@ bottom_right = "none"
         let w = parse("[zoom]\nspeed = 1.2\n").unwrap().warnings.join("\n");
         assert!(w.contains("zoom.speed"), "{w}");
         assert_eq!(parse("").unwrap().config.zoom.min, 0.1);
+        let m = parse("").unwrap().config.monitors;
+        assert!(m.names.is_empty() && m.isolate);
+        let m = parse(
+            "[monitors]
+use = [\"DISPLAY2\", \" Primary \"]
+isolate = false
+",
+        )
+        .unwrap()
+        .config
+        .monitors;
+        assert_eq!(m.names, ["display2", "primary"]);
+        assert!(!m.isolate);
         assert!(parse("[zoom]\nmin = 1.5\n").is_err());
         assert!(parse("[background]\ncolor = \"red\"\n").is_err());
         let src = "[background]\ntype = \"tile\"\ncolor = \"#102030\"\non_desktop = true\n";

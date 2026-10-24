@@ -48,6 +48,44 @@ unsafe extern "system" fn ctrl_handler(ev: u32) -> windows::core::BOOL {
     false.into()
 }
 
+/// Мониторы: все, под управлением и «стены» изоляции.
+#[derive(Clone, PartialEq)]
+struct Geometry {
+    all: Vec<dw_win::MonitorInfo>,
+    sel: Vec<dw_win::MonitorInfo>,
+    /// Прямоугольники мониторов вне списка (только при `isolate`): окна на них не заходят.
+    forbidden: Vec<(i32, i32, i32, i32)>,
+    /// Охватывающий прямоугольник выбранных мониторов — размер общего холста.
+    bounds: (i32, i32, i32, i32),
+}
+
+fn geometry(cfg: &dw_config::Config) -> Geometry {
+    let all = dw_win::monitors();
+    let sel = dw_win::select_monitors(&all, &cfg.monitors.names);
+    let forbidden = if cfg.monitors.isolate {
+        all.iter()
+            .filter(|m| !sel.iter().any(|s| s.name == m.name))
+            .map(|m| m.rect)
+            .collect()
+    } else {
+        vec![]
+    };
+    let bounds = dw_win::bounding_rect(&sel);
+    Geometry {
+        all,
+        sel,
+        forbidden,
+        bounds,
+    }
+}
+
+fn rect_hit(r: &ScreenRect, f: &(i32, i32, i32, i32)) -> bool {
+    r.x < f.0 + f.2 && r.x + r.w > f.0 && r.y < f.1 + f.3 && r.y + r.h > f.1
+}
+
+/// Куда прячем окно, перекрывающее неуправляемый монитор (видимый кадр; далеко от любых мониторов).
+const PARK_AT: i32 = -20_000;
+
 fn on_desktop(r: &dw_core::ScreenRect, vs: (i32, i32, i32, i32)) -> bool {
     r.x < vs.0 + vs.2 && r.x + r.w > vs.0 && r.y < vs.1 + vs.3 && r.y + r.h > vs.1
 }
@@ -65,6 +103,7 @@ struct Opts {
     no_auto_navigate: bool,
     /// Диагностика: сразу после старта отдалить вид до этого масштаба.
     start_zoom: Option<f64>,
+    list_monitors: bool,
 }
 
 fn exe_list(v: Option<String>) -> Vec<String> {
@@ -114,6 +153,7 @@ fn parse_args() -> Result<Opts> {
         widgets: vec![],
         no_auto_navigate: false,
         start_zoom: None,
+        list_monitors: false,
     };
     let mut a = std::env::args().skip(1);
     while let Some(x) = a.next() {
@@ -136,6 +176,7 @@ fn parse_args() -> Result<Opts> {
                 None => bail!("--config требует путь"),
             },
             "--check-config" => o.check_config = true,
+            "--list-monitors" => o.list_monitors = true,
             other => bail!("неизвестный аргумент {other}"),
         }
     }
@@ -312,9 +353,11 @@ struct App {
     zoom_target: f64,
     /// Камера до `zoom-to-fit`, чтобы вернуться повтором или правым кликом.
     overview_prev: Option<Vec2>,
-    overlay: Option<Overlay>,
-    /// Фон под окнами рабочего стола (`[background] on_desktop`).
-    desk_bg: Option<Overlay>,
+    /// По оверлею обзора на каждый управляемый монитор.
+    overlays: Vec<Overlay>,
+    /// Фон под окнами рабочего стола (`[background] on_desktop`), по одному на монитор.
+    desk_bgs: Vec<Overlay>,
+    geo: Geometry,
     bg_center: Option<Vec2>,
     /// Сколько кадров ещё держать оверлей после возврата к масштабу 1.0 (пока окна встают на места).
     hide_in: u8,
@@ -326,6 +369,7 @@ impl App {
         // после последнего сдвига даём асинхронным SetWindowPos примениться, иначе примем отставание за ручное перемещение
         let idle = self.target == self.canvas.viewport.center
             && self.last_move.elapsed() > Duration::from_millis(500);
+        let mut released = Vec::new();
         for m in found {
             if self.canvas.contains(m.id) {
                 // пользователь сам подвинул окно -> новое положение на холсте
@@ -337,9 +381,16 @@ impl App {
                         || (cur.w - prev.w).abs() > 2
                         || (cur.h - prev.h).abs() > 2)
                 {
-                    self.canvas.adopt(m.id, cur);
-                    self.last.insert(m.id, cur);
+                    if self.on_excluded_monitor(&cur) {
+                        released.push(m.id);
+                    } else {
+                        self.canvas.adopt(m.id, cur);
+                        self.last.insert(m.id, cur);
+                    }
                 }
+                continue;
+            }
+            if self.on_excluded_monitor(&m.visible) {
                 continue;
             }
             self.canvas.adopt(m.id, m.visible);
@@ -357,6 +408,9 @@ impl App {
             }
             self.adopt_rules(&m);
             self.managed.insert(m.id, m);
+        }
+        for id in released {
+            self.release(id);
         }
         let dead: Vec<_> = self
             .managed
@@ -479,6 +533,7 @@ impl App {
             self.bookmarks.entry(*n).or_insert(Vec2::new(*x, *y));
         }
         self.cfg = new;
+        self.apply_geometry();
         self.apply_background();
         tracing::info!("конфиг применён");
     }
@@ -491,8 +546,9 @@ impl App {
     }
 
     fn reset(&mut self) {
-        let (ox, oy, w, h) = dw_win::primary_monitor();
-        self.canvas = Canvas::new((ox, oy), (w, h));
+        self.geo = geometry(&self.cfg);
+        let b = self.geo.bounds;
+        self.canvas = Canvas::new((b.0, b.1), (b.2 as u32, b.3 as u32));
         self.target = self.canvas.viewport.center;
         self.managed.clear();
         self.last.clear();
@@ -518,7 +574,7 @@ impl App {
         self.zoom_target = 1.0;
         self.overview_prev = None;
         self.hide_in = 0;
-        if let Some(o) = &mut self.overlay {
+        for o in &mut self.overlays {
             o.hide();
         }
     }
@@ -557,9 +613,8 @@ impl App {
         }
     }
 
-    fn new_overlay(&self, kind: dw_render::Kind) -> Option<Overlay> {
-        let (x, y, w, h) = dw_win::primary_monitor();
-        match Overlay::new(kind, (x, y, w as i32, h as i32), self.bg_cfg()) {
+    fn new_overlay(&self, kind: dw_render::Kind, rect: (i32, i32, i32, i32)) -> Option<Overlay> {
+        match Overlay::new(kind, rect, self.bg_cfg()) {
             Ok(o) => Some(o),
             Err(e) => {
                 tracing::error!("оверлей не создан: {e}");
@@ -568,28 +623,100 @@ impl App {
         }
     }
 
+    /// Оверлеи обзора по одному на управляемый монитор.
     fn create_overlays(&mut self) {
-        self.overlay = self.new_overlay(dw_render::Kind::Overview);
+        self.desk_bgs.clear();
+        self.overlays = self
+            .geo
+            .sel
+            .iter()
+            .filter_map(|m| self.new_overlay(dw_render::Kind::Overview, m.rect))
+            .collect();
         self.apply_background();
     }
 
     /// Применить `[background]`: обновить рисование и создать/убрать фон рабочего стола.
     fn apply_background(&mut self) {
         let bg = self.bg_cfg();
-        if let Some(o) = &mut self.overlay {
+        for o in &mut self.overlays {
             o.set_bg(bg.clone());
         }
         let want_desk = self.cfg.background.on_desktop && bg.kind != BgKind::None;
-        if want_desk {
-            if self.desk_bg.is_none() {
-                self.desk_bg = self.new_overlay(dw_render::Kind::Desktop);
-            } else if let Some(d) = &mut self.desk_bg {
-                d.set_bg(bg);
+        if !want_desk {
+            self.desk_bgs.clear();
+        } else if self.desk_bgs.len() == self.geo.sel.len() {
+            for d in &mut self.desk_bgs {
+                d.set_bg(bg.clone());
             }
         } else {
-            self.desk_bg = None;
+            self.desk_bgs = self
+                .geo
+                .sel
+                .iter()
+                .filter_map(|m| self.new_overlay(dw_render::Kind::Desktop, m.rect))
+                .collect();
         }
         self.bg_center = None;
+    }
+
+    /// Мониторы или список управляемых изменились (конфиг, подключение): перестроить холст и оверлеи.
+    fn apply_geometry(&mut self) {
+        let g = geometry(&self.cfg);
+        if g == self.geo {
+            return;
+        }
+        tracing::info!(
+            "мониторы под управлением: {}",
+            g.sel
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.geo = g;
+        let b = self.geo.bounds;
+        self.canvas.origin = (b.0, b.1);
+        self.canvas.viewport.size_px = (b.2 as u32, b.3 as u32);
+        self.leave_overview_now();
+        self.create_overlays();
+        self.force_layout = true;
+    }
+
+    /// Центр окна лежит на мониторе вне списка.
+    fn on_excluded_monitor(&self, r: &ScreenRect) -> bool {
+        let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+        self.geo.all.iter().any(|m| {
+            !self.geo.sel.iter().any(|s| s.name == m.name)
+                && cx >= m.rect.0
+                && cx < m.rect.0 + m.rect.2
+                && cy >= m.rect.1
+                && cy < m.rect.1 + m.rect.3
+        })
+    }
+
+    /// Окно ушло на неуправляемый монитор: отпустить его (оно остаётся там, где его оставил пользователь).
+    fn release(&mut self, id: WindowId) {
+        if let Some(m) = self.managed.remove(&id) {
+            tracing::info!(
+                "окно «{}» ушло на неуправляемый монитор — отпущено",
+                m.title
+            );
+        }
+        self.canvas.forget(id);
+        self.mru.remove(id);
+        self.last.remove(&id);
+        self.undo.remove(&id);
+        if self.fullscreen.is_some_and(|f| f.0 == id) {
+            self.fullscreen = None;
+        }
+        let mut b = self.baseline.lock().unwrap();
+        b.entries.retain(|e| e.id != id.0);
+        let _ = b.save(&self.baseline_path);
+    }
+
+    fn view_px(&self) -> (i32, i32) {
+        let (w, h) = self.canvas.viewport.size_px;
+        (w as i32, h as i32)
     }
 
     fn scene(&self) -> dw_render::Scene {
@@ -613,6 +740,8 @@ impl App {
         dw_render::Scene {
             center: self.canvas.viewport.center,
             zoom: self.zoom,
+            view: self.view_px(),
+            origin: self.canvas.origin,
             items,
         }
     }
@@ -638,7 +767,7 @@ impl App {
     /// Показать/обновить/убрать оверлей обзора и фон рабочего стола.
     fn sync_overlay(&mut self) {
         let active = self.zoom < 0.999;
-        let visible = self.overlay.as_ref().is_some_and(Overlay::is_visible);
+        let visible = self.overlays.first().is_some_and(Overlay::is_visible);
         if active || visible {
             let mut scene = self.scene();
             if active {
@@ -647,38 +776,41 @@ impl App {
                 if !visible {
                     scene.zoom = 1.0;
                 }
-                if let Some(o) = &mut self.overlay {
-                    o.update(scene);
+                for o in &mut self.overlays {
+                    o.update(&scene);
                     if !visible {
                         o.show();
                     }
                 }
             } else if self.hide_in == 0 {
                 self.hide_in = 3;
-                if let Some(o) = &mut self.overlay {
-                    o.update(scene);
+                for o in &mut self.overlays {
+                    o.update(&scene);
                 }
             } else {
                 self.hide_in -= 1;
-                if self.hide_in == 0
-                    && let Some(o) = &mut self.overlay
-                {
-                    o.hide();
+                if self.hide_in == 0 {
+                    for o in &mut self.overlays {
+                        o.hide();
+                    }
                 }
             }
         }
         let c = self.canvas.viewport.center;
-        if self.bg_center != Some(c)
-            && let Some(d) = &mut self.desk_bg
-        {
+        if self.bg_center != Some(c) && !self.desk_bgs.is_empty() {
             self.bg_center = Some(c);
-            d.update(dw_render::Scene {
+            let scene = dw_render::Scene {
                 center: c,
                 zoom: 1.0,
+                view: self.view_px(),
+                origin: self.canvas.origin,
                 items: vec![],
-            });
-            if !d.is_visible() {
-                d.show();
+            };
+            for d in &mut self.desk_bgs {
+                d.update(&scene);
+                if !d.is_visible() {
+                    d.show();
+                }
             }
         }
     }
@@ -824,7 +956,32 @@ impl App {
         self.applied = self.canvas.viewport.center;
         self.last_move = now;
         let vs = dw_win::virtual_screen();
-        let layout = self.canvas.layout();
+        let dragged: Vec<WindowId> = match &self.drag {
+            Some(Drag::Move { ids, .. }) => ids.clone(),
+            Some(Drag::Resize { id, .. }) => vec![*id],
+            _ => vec![],
+        };
+        // изоляция: окно, перекрывающее неуправляемый монитор, прячется далеко за экранами
+        let layout: Vec<(WindowId, ScreenRect)> = self
+            .canvas
+            .layout()
+            .into_iter()
+            .map(|(id, r)| {
+                let walled = !self.canvas.is_pinned(id)
+                    && !dragged.contains(&id)
+                    && self.geo.forbidden.iter().any(|f| rect_hit(&r, f));
+                let r = if walled {
+                    ScreenRect {
+                        x: PARK_AT,
+                        y: PARK_AT,
+                        ..r
+                    }
+                } else {
+                    r
+                };
+                (id, r)
+            })
+            .collect();
         let items: Vec<_> = layout
             .iter()
             .filter(|(id, _)| !self.canvas.is_pinned(*id))
@@ -1530,6 +1687,21 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if opts.list_monitors {
+        dw_win::init_dpi();
+        for m in dw_win::monitors() {
+            println!(
+                "{}{}  {}x{} в точке ({}, {})",
+                m.name,
+                if m.primary { " (основной)" } else { "" },
+                m.rect.2,
+                m.rect.3,
+                m.rect.0,
+                m.rect.1
+            );
+        }
+        return Ok(());
+    }
     let loaded = read_config(&opts.config_path);
     if opts.check_config {
         match loaded {
@@ -1642,7 +1814,13 @@ fn main() -> Result<()> {
         .with_icon(tray_icon())
         .build()?;
 
-    let (ox, oy, w, h) = dw_win::primary_monitor();
+    let geo = geometry(&cfg);
+    let (ox, oy, w, h) = (
+        geo.bounds.0,
+        geo.bounds.1,
+        geo.bounds.2 as u32,
+        geo.bounds.3 as u32,
+    );
     let canvas = Canvas::new((ox, oy), (w, h));
     let target = canvas.viewport.center;
     let mut app = App {
@@ -1686,8 +1864,9 @@ fn main() -> Result<()> {
         zoom: 1.0,
         zoom_target: 1.0,
         overview_prev: None,
-        overlay: None,
-        desk_bg: None,
+        overlays: Vec::new(),
+        desk_bgs: Vec::new(),
+        geo,
         bg_center: None,
         hide_in: 0,
     };
@@ -1757,6 +1936,7 @@ fn main() -> Result<()> {
             app.tick();
             app.housekeeping();
             if Instant::now() >= next_scan {
+                app.apply_geometry();
                 app.rescan();
                 app.check_config_file();
                 next_scan = Instant::now() + Duration::from_secs(1);

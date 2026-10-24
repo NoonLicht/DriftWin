@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 dw-config.workspace = true
+dw-win.workspace = true
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
 toml_edit = "0.25"

@@ -307,6 +307,7 @@ impl App {
                 }
                 self.actions.insert(id.clone(), f);
             }
+            Kind::Monitors => self.monitors_picker(ui, sec, key),
             Kind::Color => {
                 let cur = doc::get_str(&self.doc, sec, key).unwrap_or_else(|| str_def.into());
                 let mut rgb = parse_hex(&cur).unwrap_or([0, 0, 0]);
@@ -360,6 +361,98 @@ impl App {
             self.actions.remove(&id);
             self.texts.remove(&id);
             self.errors.remove(&id);
+        }
+    }
+
+    /// Карта мониторов: клик включает/выключает монитор. Должен остаться хотя бы один.
+    fn monitors_picker(&mut self, ui: &mut Ui, sec: &str, key: &str) {
+        let mons = dw_win::monitors();
+        if mons.is_empty() {
+            ui.label("мониторы не найдены");
+            return;
+        }
+        let names = doc::get_list(&self.doc, sec, key);
+        let mut chosen: Vec<String> = dw_win::select_monitors(&mons, &names)
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        let before = chosen.clone();
+        let bb = dw_win::bounding_rect(&mons);
+        let k = (460.0 / bb.2 as f32).min(190.0 / bb.3 as f32);
+        let (area, _) = ui.allocate_exact_size(
+            egui::vec2(bb.2 as f32 * k, bb.3 as f32 * k),
+            egui::Sense::hover(),
+        );
+        for m in &mons {
+            let r = egui::Rect::from_min_size(
+                area.min + egui::vec2((m.rect.0 - bb.0) as f32 * k, (m.rect.1 - bb.1) as f32 * k),
+                egui::vec2(m.rect.2 as f32 * k, m.rect.3 as f32 * k),
+            )
+            .shrink(2.0);
+            let on = chosen.contains(&m.name);
+            let resp = ui
+                .interact(r, ui.id().with(&m.name), egui::Sense::click())
+                .on_hover_text(format!(
+                    "{} — нажмите, чтобы включить или выключить",
+                    m.name
+                ));
+            let (fill, line) = if on {
+                (
+                    Color32::from_rgb(40, 90, 150),
+                    Color32::from_rgb(120, 180, 255),
+                )
+            } else {
+                (Color32::from_gray(48), Color32::from_gray(110))
+            };
+            let p = ui.painter();
+            p.rect_filled(r, 4.0, fill);
+            p.rect_stroke(
+                r,
+                4.0,
+                egui::Stroke::new(1.5_f32, line),
+                egui::StrokeKind::Inside,
+            );
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                format!(
+                    "{}\n{}×{}{}\n{}",
+                    m.name.trim_start_matches("DISPLAY"),
+                    m.rect.2,
+                    m.rect.3,
+                    if m.primary {
+                        " · основной"
+                    } else {
+                        ""
+                    },
+                    if on {
+                        "управляется"
+                    } else {
+                        "не трогать"
+                    }
+                ),
+                egui::FontId::proportional(13.0),
+                Color32::WHITE,
+            );
+            if resp.clicked() {
+                if on && chosen.len() > 1 {
+                    chosen.retain(|n| *n != m.name);
+                } else if !on {
+                    chosen.push(m.name.clone());
+                }
+            }
+        }
+        if chosen != before {
+            chosen.sort();
+            let only_primary = mons
+                .iter()
+                .find(|m| m.primary)
+                .map(|m| vec![m.name.clone()]);
+            if only_primary.as_ref() == Some(&chosen) {
+                doc::remove(&mut self.doc, sec, key);
+            } else {
+                doc::set(&mut self.doc, sec, key, Array::from_iter(chosen));
+            }
         }
     }
 

@@ -71,10 +71,14 @@ pub struct Item {
     pub title: String,
 }
 
+/// Сцена общего холста: вид размером `view` пикселей, левый верхний угол которого лежит в точке
+/// `origin` экрана. Оверлей монитора рисует свою часть этого вида.
 #[derive(Debug, Clone, Default)]
 pub struct Scene {
     pub center: Vec2,
     pub zoom: f64,
+    pub view: (i32, i32),
+    pub origin: (i32, i32),
     pub items: Vec<Item>,
 }
 
@@ -100,6 +104,8 @@ pub enum Kind {
 struct Shared {
     hwnd: isize,
     kind: Kind,
+    /// Положение и размер оверлея на экране.
+    pos: (i32, i32),
     size: (i32, i32),
     scene: Scene,
     bg: BgCfg,
@@ -130,19 +136,24 @@ fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut Shared) -> R) -> Option<R> {
     st.iter_mut().find(|s| s.hwnd == hwnd.0 as isize).map(f)
 }
 
-/// Экранный прямоугольник видимого кадра окна относительно оверлея.
-fn screen_rect(scene: &Scene, size: (i32, i32), r: &Rect) -> RECT {
+/// Смещение оверлея относительно левого верхнего угла вида.
+fn offset(pos: (i32, i32), scene: &Scene) -> (i32, i32) {
+    (pos.0 - scene.origin.0, pos.1 - scene.origin.1)
+}
+
+/// Экранный прямоугольник видимого кадра окна относительно оверлея, лежащего со смещением `off`.
+fn screen_rect(scene: &Scene, off: (i32, i32), r: &Rect) -> RECT {
     let z = scene.zoom;
-    let (hw, hh) = (size.0 as f64 / 2.0, size.1 as f64 / 2.0);
+    let (hw, hh) = (scene.view.0 as f64 / 2.0, scene.view.1 as f64 / 2.0);
     let left = (r.center.x - r.w / 2.0 - scene.center.x) * z + hw;
     let right = (r.center.x + r.w / 2.0 - scene.center.x) * z + hw;
     let top = -(r.center.y + r.h / 2.0 - scene.center.y) * z + hh;
     let bottom = -(r.center.y - r.h / 2.0 - scene.center.y) * z + hh;
     RECT {
-        left: left.round() as i32,
-        top: top.round() as i32,
-        right: right.round() as i32,
-        bottom: bottom.round() as i32,
+        left: left.round() as i32 - off.0,
+        top: top.round() as i32 - off.1,
+        right: right.round() as i32 - off.0,
+        bottom: bottom.round() as i32 - off.1,
     }
 }
 
@@ -210,7 +221,7 @@ fn mouse(hwnd: HWND, msg: u32, wp: WPARAM, x: i32, y: i32) {
                     .iter()
                     .rev()
                     .find(|it| {
-                        let r = screen_rect(&s.scene, s.size, &it.rect);
+                        let r = screen_rect(&s.scene, offset(s.pos, &s.scene), &it.rect);
                         x >= r.left && x < r.right && y >= r.top && y < r.bottom
                     })
                     .map(|it| Event::Click(it.key))
@@ -228,10 +239,12 @@ fn mouse(hwnd: HWND, msg: u32, wp: WPARAM, x: i32, y: i32) {
                 let _ = ScreenToClient(hwnd, &mut p);
             }
             let steps = ((wp.0 >> 16) & 0xFFFF) as i16 as f64 / 120.0;
+            // позиция в координатах общего вида, а не одного монитора
+            let (ox, oy) = with_state(hwnd, |s| offset(s.pos, &s.scene)).unwrap_or((0, 0));
             push_event(Event::Wheel {
                 steps,
-                x: p.x,
-                y: p.y,
+                x: p.x + ox,
+                y: p.y + oy,
             });
         }
         _ => {}
@@ -299,9 +312,12 @@ impl Overlay {
             st.push(Shared {
                 hwnd: hwnd.0 as isize,
                 kind,
+                pos: (rect.0, rect.1),
                 size: (rect.2, rect.3),
                 scene: Scene {
                     zoom: 1.0,
+                    view: (rect.2, rect.3),
+                    origin: (rect.0, rect.1),
                     ..Default::default()
                 },
                 bg,
@@ -375,12 +391,12 @@ impl Overlay {
     }
 
     /// Новая сцена: обновить миниатюры и перерисовать фон.
-    pub fn update(&mut self, scene: Scene) {
+    pub fn update(&mut self, scene: &Scene) {
         if self.kind == Kind::Overview {
-            self.sync_thumbs(&scene);
+            self.sync_thumbs(scene);
         }
         let hwnd = self.hwnd;
-        with_state(hwnd, |s| s.scene = scene);
+        with_state(hwnd, |s| s.scene = scene.clone());
         if self.visible {
             self.repaint();
         }
@@ -388,6 +404,7 @@ impl Overlay {
 
     fn sync_thumbs(&mut self, scene: &Scene) {
         let size = (self.rect.2, self.rect.3);
+        let off = offset((self.rect.0, self.rect.1), scene);
         let gone: Vec<u64> = self
             .thumbs
             .keys()
@@ -418,7 +435,7 @@ impl Overlay {
                     None => continue,
                 }
             }
-            let vis = screen_rect(scene, size, &it.rect);
+            let vis = screen_rect(scene, off, &it.rect);
             let (bl, bt, br, bb) = it.border;
             let dest = RECT {
                 left: vis.left - (bl as f64 * z).round() as i32,

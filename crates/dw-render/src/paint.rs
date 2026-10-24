@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::*;
 
-use crate::{BgCfg, BgKind, Kind, Shared, screen_rect};
+use crate::{BgCfg, BgKind, Kind, Shared, offset, screen_rect};
 
 /// Картинка фона в памяти GDI.
 pub struct Image {
@@ -132,8 +132,9 @@ fn paint_bg(hdc: HDC, s: &Shared) {
     };
     let (cx, cy, z) = (s.scene.center.x, s.scene.center.y, s.scene.zoom);
     // начало координат мира на экране
-    let ox = -cx * z + f64::from(w) / 2.0;
-    let oy = cy * z + f64::from(h) / 2.0;
+    let (offx, offy) = offset(s.pos, &s.scene);
+    let ox = -cx * z + f64::from(s.scene.view.0) / 2.0 - f64::from(offx);
+    let oy = cy * z + f64::from(s.scene.view.1) / 2.0 - f64::from(offy);
     fill(hdc, &full, s.bg.color);
     match s.bg.kind {
         BgKind::None | BgKind::Solid => {}
@@ -269,7 +270,7 @@ fn paint_items(hdc: HDC, s: &Shared) {
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
         for it in &s.scene.items {
-            let r = screen_rect(&s.scene, s.size, &it.rect);
+            let r = screen_rect(&s.scene, offset(s.pos, &s.scene), &it.rect);
             if r.right < 0 || r.bottom < 0 || r.left > s.size.0 || r.top > s.size.1 {
                 continue;
             }

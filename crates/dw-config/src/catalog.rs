@@ -24,6 +24,8 @@ pub enum Kind {
     List,
     /// Цвет `#rrggbb`.
     Color,
+    /// Выбор мониторов (список имён `DISPLAY1`, … в TOML).
+    Monitors,
     /// Произвольная строка (например, путь к файлу).
     Text,
 }
@@ -81,6 +83,7 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("navigation.edge_pan", "Прокрутка у края экрана"),
     ("snap", "Привязка окон"),
     ("zoom", "Масштаб и подгонка"),
+    ("monitors", "Мониторы"),
     ("background", "Фон"),
     ("hot_corners", "Горячие углы"),
 ];
@@ -285,6 +288,22 @@ pub const SETTINGS: &[Setting] = &[
         Def::Num(80.0),
         "Отступ при fit-window, px",
         "Насколько окно меньше вида после подгонки.",
+    ),
+    s(
+        "monitors",
+        "use",
+        Kind::Monitors,
+        Def::Empty,
+        "Мониторы под управлением",
+        "Пусто — только основной. Отмеченные мониторы образуют один общий холст.",
+    ),
+    s(
+        "monitors",
+        "isolate",
+        Kind::Bool,
+        Def::Bool(true),
+        "Изоляция окон",
+        "Окна не заходят на неотмеченные мониторы: пока окно перекрывает такой монитор, оно спрятано.",
     ),
     s(
         "zoom",
@@ -566,7 +585,7 @@ mod tests {
             (_, Def::Bool(b)) => b.to_string(),
             (Kind::Int { .. }, Def::Num(n)) => format!("{}", n as i64),
             (_, Def::Num(n)) => format!("{n:?}"),
-            (Kind::List, _) => "[]".into(),
+            (Kind::List | Kind::Monitors, _) => "[]".into(),
             (_, Def::Str(s)) => format!("\"{s}\""),
             (_, Def::Empty) => "\"\"".into(),
         }
