@@ -45,6 +45,7 @@ pub struct Windows {
     pub only: Vec<String>,
     pub exclude: Vec<Exclude>,
     pub on_exit: OnExit,
+    /// Кадров в секунду; 0 — по частоте обновления мониторов.
     pub max_fps: u32,
 }
 
@@ -93,6 +94,8 @@ pub struct Zoom {
     pub min: f64,
     /// Во сколько раз меняют масштаб `zoom-in` / `zoom-out`.
     pub step: f64,
+    /// Клик по миниатюре в обзоре сразу возвращает масштаб 1:1 (иначе только фокус и центровка; двойной клик выходит).
+    pub click_exits: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +216,7 @@ struct RawZoom {
     fit_padding: Option<f64>,
     min: Option<f64>,
     step: Option<f64>,
+    click: Option<String>,
     backend: Option<String>,
     /// Остальные ключи [zoom] ещё не реализованы.
     #[serde(flatten)]
@@ -804,7 +808,13 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             "park_limit пока не настраивается (фиксировано 30000)",
         );
     }
-    let max_fps = pos_int(raw.windows.max_fps, "max_fps", 10, 240, &mut cx).unwrap_or(60) as u32;
+    let max_fps = pos_int(raw.windows.max_fps, "max_fps", 0, 240, &mut cx).unwrap_or(0) as u32;
+    if (1..10).contains(&max_fps) {
+        cx.err_at(
+            "max_fps",
+            "max_fps: 0 (по частоте мониторов) или от 10 до 240",
+        );
+    }
 
     let n = &raw.navigation;
     let pan_step = n.pan_step.unwrap_or(100.0);
@@ -921,6 +931,17 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     let zoom = Zoom {
         min: ranged(raw.zoom.min, "min", 0.1, 0.02, 0.9, &mut cx),
         step: ranged(raw.zoom.step, "step", 1.25, 1.02, 4.0, &mut cx),
+        click_exits: match raw.zoom.click.as_deref() {
+            None | Some("focus") => false,
+            Some("exit") => true,
+            Some(o) => {
+                cx.err_at(
+                    "click",
+                    format!("zoom.click = «{o}»: допустимо focus или exit"),
+                );
+                false
+            }
+        },
     };
     match raw.zoom.backend.as_deref() {
         None | Some("thumbnails") => {}
@@ -1332,6 +1353,47 @@ bottom_right = "none"
         let w = parse("[zoom]\nspeed = 1.2\n").unwrap().warnings.join("\n");
         assert!(w.contains("zoom.speed"), "{w}");
         assert_eq!(parse("").unwrap().config.zoom.min, 0.1);
+        let c = parse("").unwrap().config;
+        assert!(!c.zoom.click_exits && c.windows.max_fps == 0);
+        assert!(
+            parse(
+                "[zoom]
+click = \"exit\"
+"
+            )
+            .unwrap()
+            .config
+            .zoom
+            .click_exits
+        );
+        assert!(
+            parse(
+                "[zoom]
+click = \"x\"
+"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[windows]
+max_fps = 5
+"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse(
+                "[windows]
+max_fps = 144
+"
+            )
+            .unwrap()
+            .config
+            .windows
+            .max_fps,
+            144
+        );
         let m = parse("").unwrap().config.monitors;
         assert!(m.names.is_empty() && m.isolate);
         let m = parse(

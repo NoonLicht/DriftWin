@@ -105,20 +105,46 @@ fn mix(a: [u8; 3], b: [u8; 3], t: f64) -> [u8; 3] {
     [m(a[0], b[0]), m(a[1], b[1]), m(a[2], b[2])]
 }
 
+/// Буфер кадра, живущий между перерисовками.
+pub struct Back {
+    dc: HDC,
+    bmp: HBITMAP,
+    size: (i32, i32),
+}
+
+// HDC/HBITMAP принадлежат потоку окна; структура лежит под мьютексом
+unsafe impl Send for Back {}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.bmp.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
 pub fn paint(hdc: HDC, s: &mut Shared) {
     let (w, h) = s.size;
-    unsafe {
-        let mem = CreateCompatibleDC(Some(hdc));
-        let bmp = CreateCompatibleBitmap(hdc, w, h);
-        let old = SelectObject(mem, bmp.into());
-        paint_bg(mem, s);
-        if s.kind == Kind::Overview {
-            paint_items(mem, s);
+    if s.back.as_ref().is_none_or(|b| b.size != (w, h)) {
+        unsafe {
+            let dc = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            SelectObject(dc, bmp.into());
+            s.back = Some(Back {
+                dc,
+                bmp,
+                size: (w, h),
+            });
         }
+    }
+    let mem = s.back.as_ref().map(|b| b.dc).expect("буфер кадра");
+    paint_bg(mem, s);
+    if s.kind == Kind::Overview {
+        paint_items(mem, s);
+    }
+    unsafe {
         let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
-        SelectObject(mem, old);
-        let _ = DeleteObject(bmp.into());
-        let _ = DeleteDC(mem);
     }
 }
 

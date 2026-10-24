@@ -61,7 +61,7 @@ impl Default for BgCfg {
 }
 
 /// Окно на сцене обзора. `rect` — видимый кадр в мире (Y вверх), `border` — невидимые рамки (l, t, r, b), px.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub key: u64,
     pub hwnd: isize,
@@ -73,7 +73,7 @@ pub struct Item {
 
 /// Сцена общего холста: вид размером `view` пикселей, левый верхний угол которого лежит в точке
 /// `origin` экрана. Оверлей монитора рисует свою часть этого вида.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scene {
     pub center: Vec2,
     pub zoom: f64,
@@ -87,6 +87,8 @@ pub struct Scene {
 pub enum Event {
     /// Клик по миниатюре окна.
     Click(u64),
+    /// Двойной клик по миниатюре окна.
+    DoubleClick(u64),
     /// Перетаскивание пустого места (смещение курсора, px).
     Pan { dx: i32, dy: i32 },
     /// Колесо: число «щелчков» (вверх положительно) и позиция курсора в окне.
@@ -112,6 +114,10 @@ struct Shared {
     image: Option<paint::Image>,
     /// Последняя позиция курсора при перетаскивании и было ли заметное смещение.
     drag: Option<(i32, i32, bool)>,
+    /// Предыдущий клик по миниатюре (для двойного клика).
+    last_click: Option<(std::time::Instant, u64)>,
+    /// Память кадра, чтобы не создавать её заново на каждой перерисовке (HDC и HBITMAP как числа).
+    back: Option<paint::Back>,
 }
 
 static STATE: Mutex<Vec<Shared>> = Mutex::new(Vec::new());
@@ -216,7 +222,8 @@ fn mouse(hwnd: HWND, msg: u32, wp: WPARAM, x: i32, y: i32) {
                 if d.2 {
                     return None;
                 }
-                s.scene
+                let key = s
+                    .scene
                     .items
                     .iter()
                     .rev()
@@ -224,7 +231,17 @@ fn mouse(hwnd: HWND, msg: u32, wp: WPARAM, x: i32, y: i32) {
                         let r = screen_rect(&s.scene, offset(s.pos, &s.scene), &it.rect);
                         x >= r.left && x < r.right && y >= r.top && y < r.bottom
                     })
-                    .map(|it| Event::Click(it.key))
+                    .map(|it| it.key)?;
+                let now = std::time::Instant::now();
+                let double = s.last_click.is_some_and(|(t, k)| {
+                    k == key && now.duration_since(t) < std::time::Duration::from_millis(450)
+                });
+                s.last_click = if double { None } else { Some((now, key)) };
+                Some(if double {
+                    Event::DoubleClick(key)
+                } else {
+                    Event::Click(key)
+                })
             })
             .flatten();
             if let Some(e) = ev {
@@ -323,6 +340,8 @@ impl Overlay {
                 bg,
                 image,
                 drag: None,
+                last_click: None,
+                back: None,
             });
         }
         Ok(Self {
@@ -376,6 +395,9 @@ impl Overlay {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
+        // следующая сцена обязательно отличается: миниатюры придётся регистрировать заново
+        let hwnd = self.hwnd;
+        with_state(hwnd, |s| s.scene.zoom = -1.0);
         for (_, t) in self.thumbs.drain() {
             unsafe {
                 let _ = DwmUnregisterThumbnail(t.handle);
@@ -392,6 +414,11 @@ impl Overlay {
 
     /// Новая сцена: обновить миниатюры и перерисовать фон.
     pub fn update(&mut self, scene: &Scene) {
+        // та же сцена — ничего не меняем и не перерисовываем
+        let hwnd = self.hwnd;
+        if self.visible && with_state(hwnd, |s| s.scene == *scene).unwrap_or(false) {
+            return;
+        }
         if self.kind == Kind::Overview {
             self.sync_thumbs(scene);
         }

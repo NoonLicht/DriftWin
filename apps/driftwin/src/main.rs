@@ -26,7 +26,6 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::w;
 
 /// Через сколько без нажатий переключатель MRU фиксирует выбор.
 const CYCLE_COMMIT: Duration = Duration::from_millis(1500);
@@ -77,6 +76,14 @@ fn geometry(cfg: &dw_config::Config) -> Geometry {
         forbidden,
         bounds,
     }
+}
+
+/// Стены изоляции: прямоугольники (x, y, ширина, высота) неуправляемых мониторов.
+type Walls = Vec<(i32, i32, i32, i32)>;
+
+/// Прямоугольник целиком лежит внутри `f`.
+fn rect_inside(r: &ScreenRect, f: &(i32, i32, i32, i32)) -> bool {
+    r.x >= f.0 && r.y >= f.1 && r.x + r.w <= f.0 + f.2 && r.y + r.h <= f.1 + f.3
 }
 
 fn rect_hit(r: &ScreenRect, f: &(i32, i32, i32, i32)) -> bool {
@@ -358,6 +365,8 @@ struct App {
     /// Фон под окнами рабочего стола (`[background] on_desktop`), по одному на монитор.
     desk_bgs: Vec<Overlay>,
     geo: Geometry,
+    /// Окна, к которым применена обрезка изоляции.
+    clipped: std::collections::HashSet<WindowId>,
     bg_center: Option<Vec2>,
     /// Сколько кадров ещё держать оверлей после возврата к масштабу 1.0 (пока окна встают на места).
     hide_in: u8,
@@ -420,6 +429,7 @@ impl App {
             .collect();
         for id in dead {
             self.managed.remove(&id);
+            self.clipped.remove(&id);
             self.canvas.forget(id);
             self.mru.remove(id);
             self.last.remove(&id);
@@ -679,6 +689,8 @@ impl App {
         self.canvas.viewport.size_px = (b.2 as u32, b.3 as u32);
         self.leave_overview_now();
         self.create_overlays();
+        // стены изменились: заново расставить все окна и пересчитать обрезку
+        self.last.clear();
         self.force_layout = true;
     }
 
@@ -701,6 +713,9 @@ impl App {
                 "окно «{}» ушло на неуправляемый монитор — отпущено",
                 m.title
             );
+        }
+        if self.clipped.remove(&id) {
+            dw_win::clip_clear(id);
         }
         self.canvas.forget(id);
         self.mru.remove(id);
@@ -877,12 +892,14 @@ impl App {
             return;
         }
         match ev {
-            Event::Click(key) => {
+            Event::Click(key) | Event::DoubleClick(key) => {
                 let id = WindowId(key);
                 if self.canvas.contains(id) {
                     self.overview_prev = None;
                     self.go_to(id);
-                    self.zoom_target = 1.0;
+                    if self.cfg.zoom.click_exits || matches!(ev, Event::DoubleClick(_)) {
+                        self.zoom_target = 1.0;
+                    }
                 }
             }
             Event::Pan { dx, dy } => {
@@ -910,6 +927,16 @@ impl App {
             }
             Event::Back => self.leave_overview(),
         }
+    }
+
+    /// Частота кадров: из конфига или по самому быстрому из управляемых мониторов.
+    fn target_fps(&self) -> f64 {
+        let cfg = self.cfg.windows.max_fps;
+        if cfg > 0 {
+            return f64::from(cfg);
+        }
+        let hz = self.geo.sel.iter().map(|m| m.refresh).max().unwrap_or(0);
+        f64::from(if hz >= 30 { hz.min(240) } else { 60 })
     }
 
     fn now_secs(&self) -> f64 {
@@ -940,7 +967,8 @@ impl App {
                 if d.x.abs() < 0.5 && d.y.abs() < 0.5 {
                     self.canvas.viewport.center = self.target;
                 } else {
-                    let k = self.cfg.navigation.camera_speed;
+                    // доля пути за кадр пересчитана на реальное время кадра: на 180 Гц камера едет так же быстро, как на 60
+                    let k = 1.0 - (1.0 - self.cfg.navigation.camera_speed).powf(dt * 60.0);
                     self.canvas.viewport.center = Vec2::new(c.x + d.x * k, c.y + d.y * k);
                 }
             }
@@ -961,7 +989,8 @@ impl App {
             Some(Drag::Resize { id, .. }) => vec![*id],
             _ => vec![],
         };
-        // изоляция: окно, перекрывающее неуправляемый монитор, прячется далеко за экранами
+        // изоляция: окно целиком над неуправляемым монитором прячется далеко за экранами,
+        // перекрывающее его частично — обрезается (см. ниже)
         let layout: Vec<(WindowId, ScreenRect)> = self
             .canvas
             .layout()
@@ -969,7 +998,7 @@ impl App {
             .map(|(id, r)| {
                 let walled = !self.canvas.is_pinned(id)
                     && !dragged.contains(&id)
-                    && self.geo.forbidden.iter().any(|f| rect_hit(&r, f));
+                    && self.geo.forbidden.iter().any(|f| rect_inside(&r, f));
                 let r = if walled {
                     ScreenRect {
                         x: PARK_AT,
@@ -1002,7 +1031,22 @@ impl App {
             .collect();
         let mut moved: Vec<(&Managed, ScreenRect)> = Vec::new();
         let mut sized: Vec<(&Managed, ScreenRect)> = Vec::new();
+        let mut clipped_now: Vec<(&Managed, ScreenRect, Walls)> = Vec::new();
         for &(m, r) in &items {
+            let walls: Vec<_> = self
+                .geo
+                .forbidden
+                .iter()
+                .filter(|f| rect_hit(&r, f))
+                .copied()
+                .collect();
+            if !walls.is_empty() {
+                clipped_now.push((m, r, walls));
+                continue;
+            }
+            if self.clipped.remove(&m.id) {
+                dw_win::clip_clear(m.id);
+            }
             if self
                 .last
                 .get(&m.id)
@@ -1015,6 +1059,10 @@ impl App {
         }
         dw_win::apply(&moved);
         dw_win::apply_sized(&sized);
+        for (m, r, walls) in &clipped_now {
+            dw_win::clip_apply(m, *r, walls);
+            self.clipped.insert(m.id);
+        }
         for (m, r) in items {
             self.last.insert(m.id, r);
         }
@@ -1752,7 +1800,17 @@ fn main() -> Result<()> {
     dw_win::init_dpi();
 
     unsafe {
-        let _mutex = CreateMutexW(None, true, w!("Local\\DriftWin-single-instance"))?;
+        // экземпляр один на каталог состояния: для обычного запуска это один на пользователя
+        let tag = opts
+            .state_dir
+            .to_string_lossy()
+            .to_lowercase()
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+        let name = windows::core::HSTRING::from(format!("Local\\DriftWin-single-instance-{tag:x}"));
+        let _mutex = CreateMutexW(None, true, &name)?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             eprintln!("driftwin уже запущен");
             std::process::exit(1);
@@ -1867,11 +1925,13 @@ fn main() -> Result<()> {
         overlays: Vec::new(),
         desk_bgs: Vec::new(),
         geo,
+        clipped: Default::default(),
         bg_center: None,
         hide_in: 0,
     };
     app.create_overlays();
     app.cursor_pan_on = app.cfg.navigation.edge_pan.cursor_pan;
+    tracing::info!("частота кадров: {} Гц", app.target_fps());
     app.rescan();
     if let Some(z) = opts.start_zoom {
         app.set_zoom_target(z);
@@ -1882,6 +1942,8 @@ fn main() -> Result<()> {
         opts.config_path.display()
     );
 
+    let frame_timer = dw_win::FrameTimer::new();
+    let mut next_frame = Instant::now();
     let mut next_scan = Instant::now() + Duration::from_secs(1);
     let mut was_paused = false;
     while !QUIT.load(SeqCst) {
@@ -1942,9 +2004,14 @@ fn main() -> Result<()> {
                 next_scan = Instant::now() + Duration::from_secs(1);
             }
         }
-        std::thread::sleep(Duration::from_millis(
-            1000 / u64::from(app.cfg.windows.max_fps),
-        ));
+        // кадры по таймеру высокого разрешения: ровный темп без дрожания Sleep
+        next_frame += Duration::from_secs_f64(1.0 / app.target_fps());
+        let now = Instant::now();
+        if next_frame > now {
+            frame_timer.wait(next_frame - now);
+        } else {
+            next_frame = now;
+        }
     }
 
     let n = baseline.lock().unwrap().restore();

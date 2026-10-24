@@ -6,7 +6,7 @@ mod_key = "super"            # super | alt  (ctrl не поддерживает�
 [windows]
 only = []                    # белый список exe; вместо --only (безопасный режим требует список или --all)
 exclude = [ { exe = "Taskmgr.exe" }, { class = "Shell_TrayWnd" } ]
-max_fps = 60
+max_fps = 0                  # 0 — по частоте обновления мониторов; иначе 10..240
 panic_key = "mod+ctrl+shift+r"
 
 [navigation]

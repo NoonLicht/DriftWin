@@ -10,8 +10,9 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MONITORINFOEXW, MonitorFromPoint,
+    CombineRgn, CreateRectRgn, DEVMODEW, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors,
+    EnumDisplaySettingsW, GetMonitorInfoW, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MONITORINFOEXW, MonitorFromPoint, RGN_DIFF, SetWindowRgn,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::*;
@@ -374,6 +375,63 @@ pub fn apply(items: &[(&Managed, ScreenRect)]) {
     }
 }
 
+const CLIP_PROP: windows::core::PCWSTR = windows::core::w!("DriftWinClip");
+
+/// Поставить окно в `r` и обрезать его так, чтобы часть, лежащая в `walls` (x, y, ширина, высота на экране),
+/// не была видна. Синхронно: положение и область обрезки должны меняться согласованно.
+pub fn clip_apply(m: &Managed, r: ScreenRect, walls: &[(i32, i32, i32, i32)]) {
+    let h = hwnd_of(m.id);
+    let x = (r.x - m.border.l).clamp(-PARK_LIMIT, PARK_LIMIT);
+    let y = (r.y - m.border.t).clamp(-PARK_LIMIT, PARK_LIMIT);
+    unsafe {
+        let _ = SetWindowPos(
+            h,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOSENDCHANGING,
+        );
+        let wr = window_rect(h);
+        let (w, hh) = (wr.right - wr.left, wr.bottom - wr.top);
+        let rgn = CreateRectRgn(0, 0, w, hh);
+        for f in walls {
+            let (l, t) = ((f.0 - wr.left).clamp(0, w), (f.1 - wr.top).clamp(0, hh));
+            let (rr, b) = (
+                (f.0 + f.2 - wr.left).clamp(0, w),
+                (f.1 + f.3 - wr.top).clamp(0, hh),
+            );
+            if rr > l && b > t {
+                let wall = CreateRectRgn(l, t, rr, b);
+                CombineRgn(Some(rgn), Some(rgn), Some(wall), RGN_DIFF);
+                let _ = DeleteObject(HGDIOBJ(wall.0));
+            }
+        }
+        // система забирает область себе
+        SetWindowRgn(h, Some(rgn), true);
+        let _ = SetPropW(
+            h,
+            CLIP_PROP,
+            Some(windows::Win32::Foundation::HANDLE(std::ptr::dangling_mut())),
+        );
+    }
+}
+
+/// Снять обрезку, если она была наложена DriftWin.
+pub fn clip_clear(id: WindowId) {
+    clear_clip_hwnd(hwnd_of(id));
+}
+
+fn clear_clip_hwnd(h: HWND) {
+    unsafe {
+        if IsWindow(Some(h)).as_bool() && !GetPropW(h, CLIP_PROP).is_invalid() {
+            SetWindowRgn(h, None, true);
+            let _ = RemovePropW(h, CLIP_PROP);
+        }
+    }
+}
+
 /// Двигать и менять размер окон (видимый кадр -> оконный прямоугольник), асинхронно.
 pub fn apply_sized(items: &[(&Managed, ScreenRect)]) {
     let flags =
@@ -447,6 +505,8 @@ pub struct MonitorInfo {
     /// Прямоугольник: (x, y, ширина, высота) в координатах виртуального рабочего стола.
     pub rect: (i32, i32, i32, i32),
     pub primary: bool,
+    /// Частота обновления, Гц (0 — неизвестна).
+    pub refresh: u32,
 }
 
 unsafe extern "system" fn monitor_cb(
@@ -462,10 +522,28 @@ unsafe extern "system" fn monitor_cb(
         let r = mi.monitorInfo.rcMonitor;
         let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(0);
         let name = String::from_utf16_lossy(&mi.szDevice[..n]);
+        let mut dm = DEVMODEW {
+            dmSize: size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let refresh = if unsafe {
+            EnumDisplaySettingsW(
+                windows::core::PCWSTR(mi.szDevice.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut dm,
+            )
+        }
+        .as_bool()
+        {
+            dm.dmDisplayFrequency
+        } else {
+            0
+        };
         out.push(MonitorInfo {
             name: name.trim_start_matches("\\\\.\\").to_string(),
             rect: (r.left, r.top, r.right - r.left, r.bottom - r.top),
             primary: mi.monitorInfo.dwFlags & 1 != 0,
+            refresh,
         });
     }
     true.into()
@@ -510,6 +588,47 @@ pub fn select_monitors(all: &[MonitorInfo], names: &[String]) -> Vec<MonitorInfo
     sel
 }
 
+/// Таймер кадров с высоким разрешением (около 0,5 мс вместо ~15 мс у `Sleep`).
+pub struct FrameTimer(Option<windows::Win32::Foundation::HANDLE>);
+
+impl FrameTimer {
+    pub fn new() -> Self {
+        let h = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                None,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        }
+        .ok();
+        Self(h)
+    }
+
+    /// Подождать `d`; без высокого разрешения (старая Windows) — обычный сон.
+    pub fn wait(&self, d: std::time::Duration) {
+        let Some(h) = self.0 else {
+            std::thread::sleep(d);
+            return;
+        };
+        // относительное время в сотнях наносекунд, со знаком «минус»
+        let due = -((d.as_nanos() / 100) as i64).max(1);
+        unsafe {
+            if SetWaitableTimer(h, &due, 0, None, None, false).is_ok() {
+                WaitForSingleObject(h, INFINITE);
+            } else {
+                std::thread::sleep(d);
+            }
+        }
+    }
+}
+
+impl Default for FrameTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Прямоугольник, охватывающий все данные мониторы.
 pub fn bounding_rect(mons: &[MonitorInfo]) -> (i32, i32, i32, i32) {
     let x0 = mons.iter().map(|m| m.rect.0).min().unwrap_or(0);
@@ -528,6 +647,7 @@ mod monitor_tests {
             name: name.into(),
             rect: (x, y, w, h),
             primary,
+            refresh: 60,
         }
     }
 
@@ -626,6 +746,7 @@ impl Baseline {
         let mut n = 0;
         for e in &self.entries {
             let h = HWND(e.id as usize as *mut _);
+            clear_clip_hwnd(h);
             unsafe {
                 if !IsWindow(Some(h)).as_bool() || IsIconic(h).as_bool() || IsZoomed(h).as_bool() {
                     continue;
