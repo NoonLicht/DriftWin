@@ -977,6 +977,8 @@ impl App {
                 | Action::Quit
                 | Action::ReloadConfig
                 | Action::ToggleCursorPan
+                | Action::GapIncrease
+                | Action::GapDecrease
         ) {
             self.exit_fullscreen();
         }
@@ -987,6 +989,16 @@ impl App {
                 }
             }
             Action::ToggleFullscreen => self.toggle_fullscreen(),
+            Action::GapIncrease | Action::GapDecrease => {
+                let s = &mut self.cfg.snap;
+                let d = if a == Action::GapIncrease {
+                    s.gap_step
+                } else {
+                    -s.gap_step
+                };
+                s.gap = (s.gap + d).clamp(0.0, 200.0);
+                tracing::info!("зазор привязки: {} px", s.gap);
+            }
             Action::ToggleCursorPan => {
                 self.cursor_pan_on = !self.cursor_pan_on;
                 tracing::info!(

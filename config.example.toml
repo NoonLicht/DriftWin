@@ -32,7 +32,8 @@ latency_ms = 120
 [snap]
 enabled = true
 gap = 12                     # зазор между привязанными окнами
-outer_gap = 12               # отступ от края вида при fill-window
+gap_step = 4                # шаг изменения зазора на лету: Win+] больше, Win+[ меньше (snap-gap-increase/-decrease)
+outer_gap = 12              # отступ от края вида при fill-window
 distance = 24                # на каком расстоянии срабатывает притяжка
 break_force = 32             # насколько надо дёрнуть, чтобы отлипнуть
 corners = true               # выравнивать края соседних окон

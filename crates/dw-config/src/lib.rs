@@ -154,6 +154,7 @@ struct RawConfig {
 struct RawSnap {
     enabled: Option<bool>,
     gap: Option<f64>,
+    gap_step: Option<f64>,
     outer_gap: Option<f64>,
     distance: Option<f64>,
     break_force: Option<f64>,
@@ -339,6 +340,8 @@ fn parse_action(src: &str) -> Result<ParsedAction, String> {
         "fit-window" => Action::FitWindow,
         "fill-window" => Action::FillWindow,
         "toggle-cursor-pan" => Action::ToggleCursorPan,
+        "snap-gap-increase" => Action::GapIncrease,
+        "snap-gap-decrease" => Action::GapDecrease,
         n if UNSUPPORTED_ACTIONS.contains(&n) => return Ok(ParsedAction::Unsupported(n.into())),
         n => return Err(format!("неизвестное действие «{n}»")),
     };
@@ -374,6 +377,8 @@ fn default_keybindings(m: ModKey) -> Vec<(String, String)> {
     v.push((format!("{letter}+m"), "fit-window-snapped".into()));
     v.push((format!("{letter}+shift+m"), "fit-window".into()));
     v.push((format!("{letter}+shift+f"), "fill-window".into()));
+    v.push((format!("{letter}+rbracket"), "snap-gap-increase".into()));
+    v.push((format!("{letter}+lbracket"), "snap-gap-decrease".into()));
     if m == ModKey::Super {
         for (n, _) in DIRS {
             v.push((format!("mod+shift+{n}"), format!("move-to-snap {n}")));
@@ -759,6 +764,7 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     let snap = SnapCfg {
         enabled: sn.enabled.unwrap_or(true),
         gap: ranged(sn.gap, "gap", 12.0, 0.0, 200.0, &mut cx),
+        gap_step: ranged(sn.gap_step, "gap_step", 4.0, 1.0, 100.0, &mut cx),
         outer_gap: ranged(sn.outer_gap, "outer_gap", 12.0, 0.0, 500.0, &mut cx),
         distance: ranged(sn.distance, "distance", 24.0, 0.0, 200.0, &mut cx),
         break_force: ranged(sn.break_force, "break_force", 32.0, 0.0, 500.0, &mut cx),

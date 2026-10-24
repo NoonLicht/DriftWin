@@ -9,6 +9,8 @@ pub struct SnapCfg {
     pub enabled: bool,
     /// Зазор между привязанными окнами.
     pub gap: f64,
+    /// На сколько меняют зазор действия `snap-gap-increase` / `snap-gap-decrease`.
+    pub gap_step: f64,
     /// Отступ от края вида при fit/fill.
     pub outer_gap: f64,
     /// На каком расстоянии срабатывает привязка.
@@ -26,6 +28,7 @@ impl Default for SnapCfg {
         Self {
             enabled: true,
             gap: 12.0,
+            gap_step: 4.0,
             outer_gap: 12.0,
             distance: 24.0,
             break_force: 32.0,

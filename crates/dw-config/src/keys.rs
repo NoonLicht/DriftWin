@@ -36,6 +36,10 @@ fn key_vk(name: &str) -> Option<u16> {
         "end" => 0x23,
         "pageup" | "pgup" => 0x21,
         "pagedown" | "pgdn" => 0x22,
+        "lbracket" => 0xDB,
+        "rbracket" => 0xDD,
+        "minus" => 0xBD,
+        "equals" | "plus" => 0xBB,
         _ => return None,
     })
 }

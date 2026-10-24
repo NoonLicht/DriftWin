@@ -40,6 +40,10 @@ pub enum Action {
     FillWindow,
     /// Включить/выключить прокрутку вида курсором у края экрана.
     ToggleCursorPan,
+    /// Увеличить зазор привязки на `gap_step` (до перезагрузки конфига).
+    GapIncrease,
+    /// Уменьшить зазор привязки на `gap_step`.
+    GapDecrease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

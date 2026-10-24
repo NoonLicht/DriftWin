@@ -20,7 +20,7 @@
 | `[windows]` | `only`, `exclude` (`exe`, `class`), `max_fps`, `panic_key` (`on_exit="restore_baseline"`) |
 | `[navigation]` | `pan_step`, `camera_speed`, `mouse_speed`, `auto_navigate`, `bookmarks`, `nudge_step` (20), `resize_step` (20) |
 | `[navigation.edge_pan]` | `zone` (100), `speed_min` (4), `speed_max` (10), `cursor_pan` (false), `cursor_zone` (20), `latency_ms` (120) |
-| `[snap]` | `enabled`, `gap` (12), `outer_gap` (12), `distance` (24), `break_force` (32), `corners` (true), `centers` (false) |
+| `[snap]` | `enabled`, `gap` (12), `gap_step` (4; `Win+]` / `Win+[` меняют зазор на лету до перезагрузки конфига, действия `snap-gap-increase` / `snap-gap-decrease`), `outer_gap` (12), `distance` (24), `break_force` (32), `corners` (true), `centers` (false) |
 | `[zoom]` | только `fit_padding` (80) — отступ при `fit-window`; остальные ключи пока не работают |
 | `[hot_corners]` | `threshold` (4), `top_left`, `top_right`, `bottom_left`, `bottom_right` = любое действие; основной монитор (по мониторам — с Этапом 6) |
 | `[bindings]` | `disable_defaults = ["keys", "mouse"]` |
