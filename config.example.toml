@@ -41,6 +41,17 @@ centers = false              # выравнивать центры
 
 [zoom]
 fit_padding = 80             # отступ при fit-window
+min = 0.1                    # нижняя граница обзора; верхняя всегда 1.0
+step = 1.25                  # шаг zoom-in / zoom-out / колеса в обзоре
+
+# Фон холста: виден в обзоре (и под окнами, если on_desktop = true)
+[background]
+type = "default"             # default | grid | solid | tile | wallpaper | none
+color = "#181a20"
+grid_color = "#303440"
+grid_size = 100              # шаг сетки в мире, px
+# image = "C:/Pictures/tile.png"   # для tile и wallpaper; пусто — обои рабочего стола
+on_desktop = false           # эксперимент: рисовать фон и под окнами (скрывает значки рабочего стола)
 
 # Горячие углы основного монитора: любое действие. Выключено, пока углы не заданы.
 [hot_corners]

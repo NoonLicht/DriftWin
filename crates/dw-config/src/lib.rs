@@ -86,8 +86,41 @@ pub struct Navigation {
     pub bookmarks: BTreeMap<u8, (f64, f64)>,
 }
 
+/// Масштаб и обзор (`[zoom]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Zoom {
+    /// Нижняя граница масштаба; верхняя всегда 1.0.
+    pub min: f64,
+    /// Во сколько раз меняют масштаб `zoom-in` / `zoom-out`.
+    pub step: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BgType {
+    None,
+    Solid,
+    Grid,
+    Tile,
+    Wallpaper,
+}
+
+/// Фон холста (`[background]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Background {
+    pub kind: BgType,
+    pub color: [u8; 3],
+    pub grid_color: [u8; 3],
+    pub grid_size: f64,
+    /// Путь к картинке для `tile` и `wallpaper`; пусто — обои рабочего стола.
+    pub image: Option<String>,
+    /// Рисовать фон и на рабочем столе под окнами, а не только в обзоре.
+    pub on_desktop: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub zoom: Zoom,
+    pub background: Background,
     pub mod_key: ModKey,
     pub windows: Windows,
     pub navigation: Navigation,
@@ -139,7 +172,7 @@ struct RawConfig {
     window_rules: Vec<rules::RawRule>,
     // секции плана, которые появятся в следующих этапах
     zoom: RawZoom,
-    background: Option<toml::Value>,
+    background: RawBackground,
     snap: RawSnap,
     hot_corners: RawHotCorners,
     decorations: Option<toml::Value>,
@@ -167,7 +200,25 @@ struct RawSnap {
 #[serde(default)]
 struct RawZoom {
     fit_padding: Option<f64>,
+    min: Option<f64>,
+    step: Option<f64>,
+    backend: Option<String>,
     /// Остальные ключи [zoom] ещё не реализованы.
+    #[serde(flatten)]
+    rest: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawBackground {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    color: Option<String>,
+    grid_color: Option<String>,
+    grid_size: Option<f64>,
+    image: Option<String>,
+    on_desktop: Option<bool>,
+    /// Остальные ключи [background] ещё не реализованы.
     #[serde(flatten)]
     rest: BTreeMap<String, toml::Value>,
 }
@@ -268,12 +319,7 @@ const UNSUPPORTED_ACTIONS: &[&str] = &[
     "exec-launcher",
     "spawn",
     "suspend-window",
-    "zoom-in",
-    "zoom-out",
-    "zoom-reset",
     "move-to-bookmark",
-    "zoom-to-fit",
-    "zoom-to-fit-snapped",
     "set-trackpad",
     "send-to-output",
     "send-cursor-to-output",
@@ -343,6 +389,11 @@ fn parse_action(src: &str) -> Result<ParsedAction, String> {
         "toggle-cursor-pan" => Action::ToggleCursorPan,
         "snap-gap-increase" => Action::GapIncrease,
         "snap-gap-decrease" => Action::GapDecrease,
+        "zoom-to-fit" => Action::ZoomToFit,
+        "zoom-to-fit-snapped" => Action::ZoomToFitSnapped,
+        "zoom-in" => Action::ZoomIn,
+        "zoom-out" => Action::ZoomOut,
+        "zoom-reset" => Action::ZoomReset,
         n if UNSUPPORTED_ACTIONS.contains(&n) => return Ok(ParsedAction::Unsupported(n.into())),
         n => return Err(format!("неизвестное действие «{n}»")),
     };
@@ -378,6 +429,11 @@ fn default_keybindings(m: ModKey) -> Vec<(String, String)> {
     v.push((format!("{letter}+m"), "fit-window-snapped".into()));
     v.push((format!("{letter}+shift+m"), "fit-window".into()));
     v.push((format!("{letter}+shift+f"), "fill-window".into()));
+    v.push((format!("{letter}+w"), "zoom-to-fit".into()));
+    v.push((format!("{letter}+shift+w"), "zoom-to-fit-snapped".into()));
+    v.push(("mod+ctrl+equals".into(), "zoom-in".into()));
+    v.push(("mod+ctrl+minus".into(), "zoom-out".into()));
+    v.push(("mod+ctrl+0".into(), "zoom-reset".into()));
     v.push((format!("{letter}+rbracket"), "snap-gap-increase".into()));
     v.push((format!("{letter}+lbracket"), "snap-gap-decrease".into()));
     if m == ModKey::Super {
@@ -563,6 +619,67 @@ fn compile_mouse(raw: &RawConfig, m: ModKey, cx: &mut Ctx) -> Vec<MouseBinding> 
         .collect()
 }
 
+/// Цвет `#rrggbb` или `#rgb`.
+fn parse_color(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().strip_prefix('#')?;
+    let v = |i: usize, n: usize| u8::from_str_radix(&h[i..i + n], 16).ok();
+    match h.len() {
+        6 if h.is_ascii() => Some([v(0, 2)?, v(2, 2)?, v(4, 2)?]),
+        3 if h.is_ascii() => Some([v(0, 1)? * 17, v(1, 1)? * 17, v(2, 1)? * 17]),
+        _ => None,
+    }
+}
+
+fn compile_background(b: &RawBackground, cx: &mut Ctx) -> Background {
+    let kind = match b.kind.as_deref().unwrap_or("default") {
+        "default" | "grid" => BgType::Grid,
+        "solid" => BgType::Solid,
+        "none" => BgType::None,
+        "tile" => BgType::Tile,
+        "wallpaper" => BgType::Wallpaper,
+        "shader" => {
+            cx.warn_at(
+                "type",
+                "background.type = \"shader\" пока не поддерживается, используется сетка",
+            );
+            BgType::Grid
+        }
+        o => {
+            cx.err_at(
+                "type",
+                format!("background.type = «{o}»: допустимо default, grid, solid, tile, wallpaper, none, shader"),
+            );
+            BgType::Grid
+        }
+    };
+    let mut color = |v: &Option<String>, name: &str, def: [u8; 3]| match v {
+        None => def,
+        Some(s) => parse_color(s).unwrap_or_else(|| {
+            cx.err_at(name, format!("{name} = «{s}»: ожидается цвет вида #rrggbb"));
+            def
+        }),
+    };
+    let def = dw_core_bg_default();
+    let c = color(&b.color, "color", def.0);
+    let gc = color(&b.grid_color, "grid_color", def.1);
+    for k in b.rest.keys() {
+        cx.warn_at(k, format!("background.{k} пока не поддерживается"));
+    }
+    Background {
+        kind,
+        color: c,
+        grid_color: gc,
+        grid_size: ranged(b.grid_size, "grid_size", 100.0, 8.0, 5000.0, cx),
+        image: b.image.clone().filter(|s| !s.trim().is_empty()),
+        on_desktop: b.on_desktop.unwrap_or(false),
+    }
+}
+
+/// Цвета фона по умолчанию: (фон, линии сетки).
+fn dw_core_bg_default() -> ([u8; 3], [u8; 3]) {
+    ([24, 26, 32], [48, 52, 64])
+}
+
 fn ranged(v: Option<f64>, name: &str, def: f64, min: f64, max: f64, cx: &mut Ctx) -> f64 {
     let v = v.unwrap_or(def);
     if !(min..=max).contains(&v) {
@@ -731,7 +848,6 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
         }
     }
     for (name, set) in [
-        ("background", raw.background.is_some()),
         ("decorations", raw.decorations.is_some()),
         ("effects", raw.effects.is_some()),
         ("gestures", raw.gestures.is_some()),
@@ -783,6 +899,22 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     for k in raw.zoom.rest.keys() {
         cx.warn_at(k, format!("zoom.{k} пока не поддерживается"));
     }
+    let zoom = Zoom {
+        min: ranged(raw.zoom.min, "min", 0.1, 0.02, 0.9, &mut cx),
+        step: ranged(raw.zoom.step, "step", 1.25, 1.02, 4.0, &mut cx),
+    };
+    match raw.zoom.backend.as_deref() {
+        None | Some("thumbnails") => {}
+        Some("capture") => cx.warn_at(
+            "backend",
+            "zoom.backend = \"capture\" пока не поддерживается, используется thumbnails",
+        ),
+        Some(o) => cx.err_at(
+            "backend",
+            format!("zoom.backend = «{o}»: допустимо thumbnails или capture"),
+        ),
+    }
+    let background = compile_background(&raw.background, &mut cx);
     let hc = &raw.hot_corners;
     let corner = |v: &Option<String>, name: &str, cx: &mut Ctx| -> Option<Action> {
         let src = v.as_deref()?;
@@ -877,6 +1009,8 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             snap,
             fit_padding,
             hot_corners,
+            zoom,
+            background,
         },
         warnings: cx.warnings,
     })
@@ -1009,13 +1143,13 @@ mod tests {
 
     #[test]
     fn unknown_keys_warn_and_unsupported_warn() {
-        let src = "colour = 1\n[navigation]\npan_stp = 5\nanchors = []\n[keybindings]\n\"mod+ctrl+z\" = \"zoom-in\"\n";
+        let src = "colour = 1\n[navigation]\npan_stp = 5\nanchors = []\n[keybindings]\n\"mod+ctrl+z\" = \"exec\"\n";
         let l = parse(src).unwrap();
         let w = l.warnings.join("\n");
         assert!(w.contains("colour"), "{w}");
         assert!(w.contains("pan_stp"), "{w}");
         assert!(w.contains("anchors"), "{w}");
-        assert!(w.contains("zoom-in"), "{w}");
+        assert!(w.contains("exec"), "{w}");
     }
 
     #[test]
@@ -1165,8 +1299,17 @@ bottom_right = "none"
         assert!(parse("[snap]\ngap = -1\n").is_err());
         assert!(parse("[navigation.edge_pan]\nspeed_min = 20\nspeed_max = 5\n").is_err());
         assert!(parse("[hot_corners]\ntop_left = \"fly\"\n").is_err());
-        let w = parse("[zoom]\nstep = 1.2\n").unwrap().warnings.join("\n");
-        assert!(w.contains("zoom.step"), "{w}");
+        let w = parse("[zoom]\nspeed = 1.2\n").unwrap().warnings.join("\n");
+        assert!(w.contains("zoom.speed"), "{w}");
+        assert_eq!(parse("").unwrap().config.zoom.min, 0.1);
+        assert!(parse("[zoom]\nmin = 1.5\n").is_err());
+        assert!(parse("[background]\ncolor = \"red\"\n").is_err());
+        let src = "[background]\ntype = \"tile\"\ncolor = \"#102030\"\non_desktop = true\n";
+        let b = parse(src).unwrap().config.background;
+        assert_eq!(
+            (b.kind, b.color, b.on_desktop),
+            (BgType::Tile, [16, 32, 48], true)
+        );
     }
 
     #[test]

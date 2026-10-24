@@ -44,6 +44,14 @@ pub enum Action {
     GapIncrease,
     /// Уменьшить зазор привязки на `gap_step`.
     GapDecrease,
+    /// Обзор всех окон; повтор возвращает камеру.
+    ZoomToFit,
+    /// Обзор кластера окна в фокусе.
+    ZoomToFitSnapped,
+    ZoomIn,
+    ZoomOut,
+    /// Вернуть масштаб 1.0 в текущем положении камеры.
+    ZoomReset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

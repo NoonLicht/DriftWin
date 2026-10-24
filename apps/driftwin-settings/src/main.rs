@@ -307,6 +307,28 @@ impl App {
                 }
                 self.actions.insert(id.clone(), f);
             }
+            Kind::Color => {
+                let cur = doc::get_str(&self.doc, sec, key).unwrap_or_else(|| str_def.into());
+                let mut rgb = parse_hex(&cur).unwrap_or([0, 0, 0]);
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    let hex = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                    doc::set(&mut self.doc, sec, key, hex);
+                }
+            }
+            Kind::Text => {
+                let cur = doc::get_str(&self.doc, sec, key).unwrap_or_default();
+                let buf = self.texts.entry(id.clone()).or_insert(cur);
+                if ui
+                    .add(egui::TextEdit::singleline(buf).desired_width(320.0))
+                    .changed()
+                {
+                    if buf.trim().is_empty() {
+                        doc::remove(&mut self.doc, sec, key);
+                    } else {
+                        doc::set(&mut self.doc, sec, key, buf.trim().to_string());
+                    }
+                }
+            }
             Kind::List => {
                 let cur = doc::get_list(&self.doc, sec, key).join(", ");
                 let buf = self.texts.entry(id.clone()).or_insert(cur);
@@ -697,6 +719,15 @@ impl App {
             ui.label(r);
         }
     }
+}
+
+fn parse_hex(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().strip_prefix('#')?;
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let v = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([v(0)?, v(2)?, v(4)?])
 }
 
 fn pretty_combo(combo: &str, mk: &str) -> String {

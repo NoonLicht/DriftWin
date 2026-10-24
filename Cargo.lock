@@ -417,6 +417,7 @@ dependencies = [
  "dw-config",
  "dw-core",
  "dw-input",
+ "dw-render",
  "dw-win",
  "tracing",
  "tracing-subscriber",
@@ -489,6 +490,12 @@ dependencies = [
 [[package]]
 name = "dw-render"
 version = "0.0.1"
+dependencies = [
+ "dw-core",
+ "image",
+ "tracing",
+ "windows",
+]
 
 [[package]]
 name = "dw-win"
@@ -983,6 +990,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

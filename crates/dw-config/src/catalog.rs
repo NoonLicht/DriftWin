@@ -22,6 +22,10 @@ pub enum Kind {
     Action,
     /// Список строк (в TOML — массив).
     List,
+    /// Цвет `#rrggbb`.
+    Color,
+    /// Произвольная строка (например, путь к файлу).
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +81,7 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("navigation.edge_pan", "Прокрутка у края экрана"),
     ("snap", "Привязка окон"),
     ("zoom", "Масштаб и подгонка"),
+    ("background", "Фон"),
     ("hot_corners", "Горячие углы"),
 ];
 
@@ -282,6 +287,70 @@ pub const SETTINGS: &[Setting] = &[
         "Насколько окно меньше вида после подгонки.",
     ),
     s(
+        "zoom",
+        "min",
+        f(0.02, 0.9),
+        Def::Num(0.1),
+        "Минимальный масштаб обзора",
+        "Насколько далеко можно отдалить вид (1 — обычный масштаб).",
+    ),
+    s(
+        "zoom",
+        "step",
+        f(1.02, 4.0),
+        Def::Num(1.25),
+        "Шаг масштаба",
+        "Во сколько раз меняют масштаб zoom-in, zoom-out и колесо мыши в обзоре.",
+    ),
+    s(
+        "background",
+        "type",
+        Kind::Choice(&["default", "grid", "solid", "tile", "wallpaper", "none"]),
+        Def::Str("default"),
+        "Тип фона",
+        "default и grid — сетка; tile — повторяющаяся картинка; wallpaper — одна картинка в начале координат.",
+    ),
+    s(
+        "background",
+        "color",
+        Kind::Color,
+        Def::Str("#181a20"),
+        "Цвет фона",
+        "",
+    ),
+    s(
+        "background",
+        "grid_color",
+        Kind::Color,
+        Def::Str("#303440"),
+        "Цвет линий сетки",
+        "",
+    ),
+    s(
+        "background",
+        "grid_size",
+        f(8.0, 5000.0),
+        Def::Num(100.0),
+        "Шаг сетки, px",
+        "Расстояние между линиями в мире.",
+    ),
+    s(
+        "background",
+        "image",
+        Kind::Text,
+        Def::Empty,
+        "Картинка для tile и wallpaper",
+        "Путь к PNG, JPEG или BMP. Пусто — обои рабочего стола.",
+    ),
+    s(
+        "background",
+        "on_desktop",
+        Kind::Bool,
+        Def::Bool(false),
+        "Фон и на рабочем столе",
+        "Рисовать фон под окнами, а не только в обзоре (скрывает значки рабочего стола). Эксперимент.",
+    ),
+    s(
         "hot_corners",
         "threshold",
         i(1, 100),
@@ -384,6 +453,11 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("fit-window", Arg::None, "Подогнать под вид"),
     a("fill-window", Arg::None, "Занять свободное место"),
     a("toggle-cursor-pan", Arg::None, "Прокрутка курсором у края"),
+    a("zoom-to-fit", Arg::None, "Обзор всех окон (повтор — назад)"),
+    a("zoom-to-fit-snapped", Arg::None, "Обзор кластера окна"),
+    a("zoom-in", Arg::None, "Приблизить"),
+    a("zoom-out", Arg::None, "Отдалить"),
+    a("zoom-reset", Arg::None, "Масштаб 1:1"),
     a("snap-gap-increase", Arg::None, "Зазор больше"),
     a("snap-gap-decrease", Arg::None, "Зазор меньше"),
 ];

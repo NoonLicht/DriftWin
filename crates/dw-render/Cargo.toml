@@ -6,3 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dw-core.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+tracing.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
+  "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+]

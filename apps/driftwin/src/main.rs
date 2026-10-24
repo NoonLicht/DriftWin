@@ -16,6 +16,7 @@ use dw_core::nav::{Inertia, Mru, VelocityTracker};
 use dw_core::snap::{self, Edges, SnapDrag, SnapResize};
 use dw_core::{Dir, Rect, ScreenRect, Vec2, WindowId, canvas::Canvas};
 use dw_input::Input;
+use dw_render::{BgCfg, BgKind, Overlay};
 use dw_win::{Baseline, Filter, Managed};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
@@ -62,6 +63,8 @@ struct Opts {
     /// Имена exe (нижний регистр): виджеты (остаются на холсте, вне навигации).
     widgets: Vec<String>,
     no_auto_navigate: bool,
+    /// Диагностика: сразу после старта отдалить вид до этого масштаба.
+    start_zoom: Option<f64>,
 }
 
 fn exe_list(v: Option<String>) -> Vec<String> {
@@ -110,6 +113,7 @@ fn parse_args() -> Result<Opts> {
         pinned: vec![],
         widgets: vec![],
         no_auto_navigate: false,
+        start_zoom: None,
     };
     let mut a = std::env::args().skip(1);
     while let Some(x) = a.next() {
@@ -125,6 +129,7 @@ fn parse_args() -> Result<Opts> {
             "--pinned" => o.pinned = exe_list(a.next()),
             "--widget" => o.widgets = exe_list(a.next()),
             "--no-auto-navigate" => o.no_auto_navigate = true,
+            "--start-zoom" => o.start_zoom = a.next().and_then(|v| v.parse().ok()),
             "--state-dir" => o.state_dir = a.next().map(PathBuf::from).unwrap_or(o.state_dir),
             "--config" => match a.next() {
                 Some(p) => o.config_path = PathBuf::from(p),
@@ -172,6 +177,22 @@ fn filter_from(cfg: &dw_config::Config, only: Option<Vec<String>>) -> Filter {
             .filter_map(|e| e.class.clone())
             .collect(),
     }
+}
+
+/// Файл обоев рабочего стола.
+fn system_wallpaper() -> Option<PathBuf> {
+    let mut buf = [0u16; 520];
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETDESKWALLPAPER,
+            buf.len() as u32,
+            Some(buf.as_mut_ptr().cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .ok()?;
+    }
+    let n = buf.iter().position(|&c| c == 0)?;
+    (n > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
 fn tray_icon() -> Icon {
@@ -286,6 +307,17 @@ struct App {
     edge_since: Option<Instant>,
     /// Угол, в котором сейчас курсор (0 — левый верхний, по часовой стрелке).
     in_corner: Option<usize>,
+    /// Масштаб вида (1.0 — обычный режим, меньше — обзор через миниатюры) и его цель.
+    zoom: f64,
+    zoom_target: f64,
+    /// Камера до `zoom-to-fit`, чтобы вернуться повтором или правым кликом.
+    overview_prev: Option<Vec2>,
+    overlay: Option<Overlay>,
+    /// Фон под окнами рабочего стола (`[background] on_desktop`).
+    desk_bg: Option<Overlay>,
+    bg_center: Option<Vec2>,
+    /// Сколько кадров ещё держать оверлей после возврата к масштабу 1.0 (пока окна встают на места).
+    hide_in: u8,
 }
 
 impl App {
@@ -447,6 +479,7 @@ impl App {
             self.bookmarks.entry(*n).or_insert(Vec2::new(*x, *y));
         }
         self.cfg = new;
+        self.apply_background();
         tracing::info!("конфиг применён");
     }
 
@@ -470,6 +503,281 @@ impl App {
         self.fullscreen = None;
         self.undo.clear();
         self.size_checks.clear();
+        self.leave_overview_now();
+    }
+
+    // ---------- масштаб и обзор ----------
+
+    fn in_overview(&self) -> bool {
+        self.zoom < 0.999 || self.zoom_target < 0.999
+    }
+
+    /// Мгновенно вернуться к масштабу 1.0 и убрать оверлей (пауза, сброс).
+    fn leave_overview_now(&mut self) {
+        self.zoom = 1.0;
+        self.zoom_target = 1.0;
+        self.overview_prev = None;
+        self.hide_in = 0;
+        if let Some(o) = &mut self.overlay {
+            o.hide();
+        }
+    }
+
+    /// Выйти из обзора с анимацией; если камеру двигал `zoom-to-fit`, вернуть её на место.
+    fn leave_overview(&mut self) {
+        self.zoom_target = 1.0;
+        if let Some(p) = self.overview_prev.take() {
+            self.inertia.stop();
+            self.target = p;
+        }
+    }
+
+    fn bg_cfg(&self) -> BgCfg {
+        use dw_config::BgType;
+        let b = &self.cfg.background;
+        let kind = match b.kind {
+            BgType::None => BgKind::None,
+            BgType::Solid => BgKind::Solid,
+            BgType::Grid => BgKind::Grid,
+            BgType::Tile => BgKind::Tile,
+            BgType::Wallpaper => BgKind::Wallpaper,
+        };
+        let image = match kind {
+            BgKind::Tile | BgKind::Wallpaper => {
+                b.image.clone().map(PathBuf::from).or_else(system_wallpaper)
+            }
+            _ => None,
+        };
+        BgCfg {
+            kind,
+            color: b.color,
+            grid_color: b.grid_color,
+            grid_size: b.grid_size,
+            image,
+        }
+    }
+
+    fn new_overlay(&self, kind: dw_render::Kind) -> Option<Overlay> {
+        let (x, y, w, h) = dw_win::primary_monitor();
+        match Overlay::new(kind, (x, y, w as i32, h as i32), self.bg_cfg()) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                tracing::error!("оверлей не создан: {e}");
+                None
+            }
+        }
+    }
+
+    fn create_overlays(&mut self) {
+        self.overlay = self.new_overlay(dw_render::Kind::Overview);
+        self.apply_background();
+    }
+
+    /// Применить `[background]`: обновить рисование и создать/убрать фон рабочего стола.
+    fn apply_background(&mut self) {
+        let bg = self.bg_cfg();
+        if let Some(o) = &mut self.overlay {
+            o.set_bg(bg.clone());
+        }
+        let want_desk = self.cfg.background.on_desktop && bg.kind != BgKind::None;
+        if want_desk {
+            if self.desk_bg.is_none() {
+                self.desk_bg = self.new_overlay(dw_render::Kind::Desktop);
+            } else if let Some(d) = &mut self.desk_bg {
+                d.set_bg(bg);
+            }
+        } else {
+            self.desk_bg = None;
+        }
+        self.bg_center = None;
+    }
+
+    fn scene(&self) -> dw_render::Scene {
+        let fg = dw_win::foreground();
+        let mut ids: Vec<WindowId> = self.canvas.navigable().collect();
+        ids.sort_by_key(|i| i.0);
+        let items = ids
+            .into_iter()
+            .filter_map(|id| {
+                let m = self.managed.get(&id)?;
+                Some(dw_render::Item {
+                    key: id.0,
+                    hwnd: id.0 as isize,
+                    rect: self.canvas.rect(id)?,
+                    border: (m.border.l, m.border.t, m.border.r, m.border.b),
+                    focused: fg == Some(id),
+                    title: m.title.clone(),
+                })
+            })
+            .collect();
+        dw_render::Scene {
+            center: self.canvas.viewport.center,
+            zoom: self.zoom,
+            items,
+        }
+    }
+
+    /// Анимация масштаба (в логарифмической шкале, ~14 в секунду).
+    fn step_zoom(&mut self, dt: f64) {
+        if self.zoom == self.zoom_target {
+            return;
+        }
+        let (a, b) = (self.zoom.ln(), self.zoom_target.ln());
+        if (b - a).abs() < 0.004 {
+            self.zoom = self.zoom_target;
+        } else {
+            self.zoom = (a + (b - a) * (1.0 - (-dt * 14.0).exp())).exp();
+        }
+        if self.zoom >= 0.999 {
+            self.zoom = 1.0;
+            // окна встают на места камеры, пока оверлей ещё закрывает экран
+            self.force_layout = true;
+        }
+    }
+
+    /// Показать/обновить/убрать оверлей обзора и фон рабочего стола.
+    fn sync_overlay(&mut self) {
+        let active = self.zoom < 0.999;
+        let visible = self.overlay.as_ref().is_some_and(Overlay::is_visible);
+        if active || visible {
+            let mut scene = self.scene();
+            if active {
+                self.hide_in = 0;
+                // первый кадр совпадает с положением настоящих окон
+                if !visible {
+                    scene.zoom = 1.0;
+                }
+                if let Some(o) = &mut self.overlay {
+                    o.update(scene);
+                    if !visible {
+                        o.show();
+                    }
+                }
+            } else if self.hide_in == 0 {
+                self.hide_in = 3;
+                if let Some(o) = &mut self.overlay {
+                    o.update(scene);
+                }
+            } else {
+                self.hide_in -= 1;
+                if self.hide_in == 0
+                    && let Some(o) = &mut self.overlay
+                {
+                    o.hide();
+                }
+            }
+        }
+        let c = self.canvas.viewport.center;
+        if self.bg_center != Some(c)
+            && let Some(d) = &mut self.desk_bg
+        {
+            self.bg_center = Some(c);
+            d.update(dw_render::Scene {
+                center: c,
+                zoom: 1.0,
+                items: vec![],
+            });
+            if !d.is_visible() {
+                d.show();
+            }
+        }
+    }
+
+    fn zoom_to_fit(&mut self, snapped: bool) {
+        if !snapped && self.zoom_target < 0.999 {
+            self.leave_overview();
+            return;
+        }
+        let ids: Vec<WindowId> = if snapped {
+            let items = self.canvas.snap_items();
+            self.focused_nav()
+                .map(|id| snap::cluster_of(&items, id, self.cfg.snap.gap))
+                .unwrap_or_default()
+        } else {
+            self.canvas.navigable().collect()
+        };
+        let rects: Vec<Rect> = ids.iter().filter_map(|id| self.canvas.rect(*id)).collect();
+        if rects.is_empty() {
+            return;
+        }
+        let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for r in &rects {
+            x0 = x0.min(r.center.x - r.w / 2.0);
+            x1 = x1.max(r.center.x + r.w / 2.0);
+            y0 = y0.min(r.center.y - r.h / 2.0);
+            y1 = y1.max(r.center.y + r.h / 2.0);
+        }
+        let pad = self.cfg.fit_padding;
+        let (vw, vh) = self.canvas.viewport.size_px;
+        let z = (f64::from(vw) / (x1 - x0 + 2.0 * pad))
+            .min(f64::from(vh) / (y1 - y0 + 2.0 * pad))
+            .clamp(self.cfg.zoom.min, 1.0);
+        let z = if z > 0.98 { 1.0 } else { z };
+        if self.zoom_target >= 0.999 && z < 0.999 {
+            self.overview_prev = Some(self.canvas.viewport.center);
+        }
+        self.exit_fullscreen();
+        self.inertia.stop();
+        self.target = Vec2::new((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        self.zoom_target = z;
+    }
+
+    fn zoom_step_by(&mut self, zoom_in: bool) {
+        let s = self.cfg.zoom.step;
+        let z = if zoom_in {
+            self.zoom_target * s
+        } else {
+            self.zoom_target / s
+        };
+        self.set_zoom_target(z);
+    }
+
+    fn set_zoom_target(&mut self, z: f64) {
+        let z = z.clamp(self.cfg.zoom.min, 1.0);
+        self.exit_fullscreen();
+        self.zoom_target = if z > 0.98 { 1.0 } else { z };
+    }
+
+    /// События мыши на оверлее обзора.
+    fn overlay_event(&mut self, ev: dw_render::Event) {
+        use dw_render::Event;
+        if !self.in_overview() {
+            return;
+        }
+        match ev {
+            Event::Click(key) => {
+                let id = WindowId(key);
+                if self.canvas.contains(id) {
+                    self.overview_prev = None;
+                    self.go_to(id);
+                    self.zoom_target = 1.0;
+                }
+            }
+            Event::Pan { dx, dy } => {
+                let z = self.zoom.max(0.02);
+                self.inertia.stop();
+                let c = self.canvas.viewport.center;
+                self.canvas.viewport.center =
+                    Vec2::new(c.x - f64::from(dx) / z, c.y + f64::from(dy) / z);
+                self.target = self.canvas.viewport.center;
+            }
+            Event::Wheel { steps, x, y } => {
+                // точка под курсором остаётся на месте
+                let (w, h) = self.canvas.viewport.size_px;
+                let z = self.zoom.max(0.02);
+                let c = self.canvas.viewport.center;
+                let (sx, sy) = (
+                    f64::from(x) - f64::from(w) / 2.0,
+                    f64::from(y) - f64::from(h) / 2.0,
+                );
+                let (px, py) = (c.x + sx / z, c.y - sy / z);
+                self.set_zoom_target(self.zoom_target * self.cfg.zoom.step.powf(steps));
+                let nz = self.zoom_target;
+                self.inertia.stop();
+                self.target = Vec2::new(px - sx / nz, py + sy / nz);
+            }
+            Event::Back => self.leave_overview(),
+        }
     }
 
     fn now_secs(&self) -> f64 {
@@ -477,9 +785,15 @@ impl App {
     }
 
     fn tick(&mut self) {
+        self.tick_inner();
+        self.sync_overlay();
+    }
+
+    fn tick_inner(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
         self.last_tick = now;
+        self.step_zoom(dt);
         self.edge_pan(dt);
         self.hot_corners();
         if self.inertia.active() {
@@ -498,6 +812,10 @@ impl App {
                     self.canvas.viewport.center = Vec2::new(c.x + d.x * k, c.y + d.y * k);
                 }
             }
+        }
+        // в обзоре настоящие окна стоят на месте: их картинку двигает оверлей
+        if self.zoom < 0.999 {
+            return;
         }
         if !self.force_layout && self.canvas.viewport.center == self.applied {
             return;
@@ -567,6 +885,10 @@ impl App {
         self.target = self.canvas.viewport.center;
         if kind == DragKind::Pan {
             self.drag = Some(Drag::Pan);
+            return;
+        }
+        if self.in_overview() {
+            self.drag = None;
             return;
         }
         let Some(id) = self.canvas_window_at(x, y) else {
@@ -708,6 +1030,9 @@ impl App {
     }
 
     fn toggle_fullscreen(&mut self) {
+        if self.in_overview() {
+            return;
+        }
         if self.fullscreen.is_some() {
             self.exit_fullscreen();
             return;
@@ -744,6 +1069,9 @@ impl App {
     }
 
     fn window_action(&mut self, a: Action, id: WindowId) {
+        if self.in_overview() {
+            return;
+        }
         let Some(rect) = self.canvas.rect(id) else {
             return;
         };
@@ -808,6 +1136,10 @@ impl App {
 
     /// Прокрутка вида у края экрана: при перетаскивании окна и (по желанию) просто курсором.
     fn edge_pan(&mut self, dt: f64) {
+        if self.in_overview() {
+            self.edge_since = None;
+            return;
+        }
         let ep = self.cfg.navigation.edge_pan.clone();
         let dragging = matches!(self.drag, Some(Drag::Move { .. } | Drag::Resize { .. }));
         let by_cursor = self.cursor_pan_on && self.drag.is_none() && self.fullscreen.is_none();
@@ -930,6 +1262,7 @@ impl App {
         self.mru.touch(id);
         if self.cfg.navigation.auto_navigate
             && !self.no_auto_navigate
+            && !self.in_overview()
             && self.drag.is_none()
             && let Some(r) = self.canvas.screen_rect(id)
         {
@@ -949,7 +1282,7 @@ impl App {
             Input::DragStart { kind, x, y } => self.begin_drag(kind, x, y),
             Input::Drag { dx, dy } => match self.drag {
                 Some(Drag::Pan) => {
-                    let k = self.cfg.navigation.mouse_speed;
+                    let k = self.cfg.navigation.mouse_speed / self.zoom.max(0.02);
                     let (dx, dy) = (dx as f64 * k, dy as f64 * k);
                     self.inertia.stop();
                     self.canvas.pan_px(-dx, -dy);
@@ -1012,6 +1345,14 @@ impl App {
                     self.window_action(a, id);
                 }
             }
+            Action::ZoomToFit => self.zoom_to_fit(false),
+            Action::ZoomToFitSnapped => self.zoom_to_fit(true),
+            Action::ZoomIn => self.zoom_step_by(true),
+            Action::ZoomOut => self.zoom_step_by(false),
+            Action::ZoomReset => {
+                self.overview_prev = None;
+                self.zoom_target = 1.0;
+            }
             Action::ToggleFullscreen => self.toggle_fullscreen(),
             Action::GapIncrease | Action::GapDecrease => {
                 let s = &mut self.cfg.snap;
@@ -1043,7 +1384,7 @@ impl App {
             }
             Action::PanViewport(d) => {
                 self.inertia.stop();
-                let step = self.cfg.navigation.pan_step;
+                let step = self.cfg.navigation.pan_step / self.zoom.max(0.05);
                 match d {
                     Dir::Left => self.target.x -= step,
                     Dir::Right => self.target.x += step,
@@ -1342,9 +1683,20 @@ fn main() -> Result<()> {
         cursor_pan_on: false,
         edge_since: None,
         in_corner: None,
+        zoom: 1.0,
+        zoom_target: 1.0,
+        overview_prev: None,
+        overlay: None,
+        desk_bg: None,
+        bg_center: None,
+        hide_in: 0,
     };
+    app.create_overlays();
     app.cursor_pan_on = app.cfg.navigation.edge_pan.cursor_pan;
     app.rescan();
+    if let Some(z) = opts.start_zoom {
+        app.set_zoom_target(z);
+    }
     tracing::info!(
         "готово: окон под управлением {}, монитор {w}x{h}, конфиг {} (по умолчанию аварийный возврат — Win+Ctrl+Shift+R)",
         app.canvas.len(),
@@ -1381,6 +1733,9 @@ fn main() -> Result<()> {
         dw_input::set_enabled(!is_paused);
         if is_paused != was_paused {
             was_paused = is_paused;
+            if is_paused {
+                app.leave_overview_now();
+            }
             if !is_paused {
                 app.reset();
                 app.rescan();
@@ -1390,6 +1745,11 @@ fn main() -> Result<()> {
         while let Ok(ev) = rx.try_recv() {
             if !is_paused {
                 app.handle(ev);
+            }
+        }
+        for ev in dw_render::drain_events() {
+            if !is_paused {
+                app.overlay_event(ev);
             }
         }
         if !is_paused {
