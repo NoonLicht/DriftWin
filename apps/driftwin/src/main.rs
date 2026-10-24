@@ -996,8 +996,15 @@ impl App {
                 } else {
                     -s.gap_step
                 };
-                s.gap = (s.gap + d).clamp(0.0, 200.0);
-                tracing::info!("зазор привязки: {} px", s.gap);
+                let old = s.gap;
+                s.gap = (old + d).clamp(0.0, 200.0);
+                let new = s.gap;
+                tracing::info!("зазор привязки: {new} px");
+                if new != old {
+                    let items = self.canvas.snap_items();
+                    let changes = snap::regap(&items, old, new);
+                    self.set_rects(changes);
+                }
             }
             Action::ToggleCursorPan => {
                 self.cursor_pan_on = !self.cursor_pan_on;

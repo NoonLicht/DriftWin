@@ -457,6 +457,52 @@ pub fn resize_keep_cluster(
     out
 }
 
+/// Пересобрать кластеры под новый зазор: каждое окно сдвигается так, чтобы расстояние до
+/// соседей с «меньшей» стороны стало `new_gap`. Окна без таких соседей остаются на месте.
+/// Возвращает только изменившиеся окна.
+pub fn regap(items: &[(WindowId, Rect)], old_gap: f64, new_gap: f64) -> Vec<(WindowId, Rect)> {
+    let mut shift = vec![Vec2::default(); items.len()];
+    for ax in 0..2 {
+        let perp = 1 - ax;
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by(|&a, &b| span(&items[a].1, ax).0.total_cmp(&span(&items[b].1, ax).0));
+        let mut sh = vec![0.0f64; items.len()];
+        for &w in &order {
+            let sw = span(&items[w].1, ax);
+            let mut start: Option<f64> = None;
+            for (n, (_, rn)) in items.iter().enumerate() {
+                let sn = span(rn, ax);
+                if n == w
+                    || sn.0 >= sw.0
+                    || sn.1 > sw.0 + ADJ_TOL
+                    || gap_between(span(rn, perp), span(&items[w].1, perp)) >= -OVERLAP_EPS
+                    || gap_between(sn, sw) > old_gap + ADJ_TOL
+                {
+                    continue;
+                }
+                let cand = sn.1 + sh[n] + new_gap;
+                start = Some(start.map_or(cand, |s| s.max(cand)));
+            }
+            if let Some(s) = start {
+                sh[w] = s - sw.0;
+            }
+        }
+        for (i, d) in sh.iter().enumerate() {
+            if ax == 0 {
+                shift[i].x = *d;
+            } else {
+                shift[i].y = *d;
+            }
+        }
+    }
+    items
+        .iter()
+        .zip(&shift)
+        .filter(|(_, d)| d.x.abs() > 1e-9 || d.y.abs() > 1e-9)
+        .map(|((id, r), d)| (*id, translated(r, *d)))
+        .collect()
+}
+
 // ---------- fit / fill ----------
 
 /// Прямоугольник вида, сжатый на `padding` с каждой стороны (для fit-window).
@@ -647,6 +693,36 @@ mod tests {
             let d = s.update(Vec2::default(), &[m], &others, &cfg());
             let r = translated(&m, d);
             assert!(others.iter().all(|o| !overlaps(&r, o)));
+        }
+    }
+
+    #[test]
+    fn regap_rebuilds_cluster() {
+        let items = [
+            (WindowId(1), rc(0.0, 0.0, 400.0, 300.0)),
+            (WindowId(2), rc(412.0, 0.0, 400.0, 300.0)),
+            (WindowId(3), rc(824.0, 0.0, 400.0, 300.0)),
+            (WindowId(4), rc(412.0, 312.0, 400.0, 300.0)), // над вторым
+            (WindowId(5), rc(2000.0, 0.0, 400.0, 300.0)),  // не в кластере
+        ];
+        let out = regap(&items, 12.0, 20.0);
+        let get = |id: u64| out.iter().find(|(i, _)| i.0 == id).map(|(_, r)| *r);
+        assert!(get(1).is_none() && get(5).is_none());
+        assert_eq!(get(2).unwrap().center.x, items[1].1.center.x + 8.0);
+        assert_eq!(get(3).unwrap().center.x, items[2].1.center.x + 16.0);
+        assert_eq!(get(4).unwrap().center.y, items[3].1.center.y + 8.0);
+        assert_eq!(get(4).unwrap().center.x, items[3].1.center.x);
+        // обратно в 12 — исходная раскладка
+        let back: Vec<_> = items
+            .iter()
+            .map(|(i, r)| (*i, get(i.0).unwrap_or(*r)))
+            .collect();
+        let again = regap(&back, 20.0, 12.0);
+        for (i, r) in again {
+            let o = items.iter().find(|(j, _)| *j == i).unwrap().1;
+            assert!(
+                (r.center.x - o.center.x).abs() < 1e-9 && (r.center.y - o.center.y).abs() < 1e-9
+            );
         }
     }
 
