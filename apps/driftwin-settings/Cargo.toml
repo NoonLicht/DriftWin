@@ -6,4 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-dw-core.workspace = true
+dw-config.workspace = true
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+toml_edit = "0.25"

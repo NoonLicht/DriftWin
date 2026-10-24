@@ -76,6 +76,30 @@ fn env_dir(var: &str) -> PathBuf {
     PathBuf::from(std::env::var(var).unwrap_or_else(|_| ".".into())).join("DriftWin")
 }
 
+/// Запустить окно настроек (одно на всех); если оно уже открыто, ничего не делать.
+fn open_settings(proc: &mut Option<std::process::Child>, config: &Path) {
+    if let Some(p) = proc
+        && matches!(p.try_wait(), Ok(None))
+    {
+        return;
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("driftwin-settings.exe")))
+        .filter(|p| p.exists());
+    match exe {
+        Some(exe) => match std::process::Command::new(exe)
+            .arg("--config")
+            .arg(config)
+            .spawn()
+        {
+            Ok(c) => *proc = Some(c),
+            Err(e) => tracing::warn!("не удалось запустить настройки: {e}"),
+        },
+        None => tracing::warn!("driftwin-settings.exe не найден рядом с демоном"),
+    }
+}
+
 fn parse_args() -> Result<Opts> {
     let mut o = Opts {
         only_cli: None,
@@ -1267,8 +1291,10 @@ fn main() -> Result<()> {
     let i_pause = MenuItem::new("Пауза / продолжить", true, None);
     let i_back = MenuItem::new("Вернуть окна на места", true, None);
     let i_reload = MenuItem::new("Перечитать конфиг", true, None);
+    let i_settings = MenuItem::new("Настройки…", true, None);
     let i_quit = MenuItem::new("Выход", true, None);
-    menu.append_items(&[&i_pause, &i_back, &i_reload, &i_quit])?;
+    menu.append_items(&[&i_settings, &i_pause, &i_back, &i_reload, &i_quit])?;
+    let mut settings_proc: Option<std::process::Child> = None;
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("DriftWin")
@@ -1347,6 +1373,8 @@ fn main() -> Result<()> {
                 baseline.lock().unwrap().restore();
             } else if ev.id == *i_reload.id() {
                 app.reload_config();
+            } else if ev.id == *i_settings.id() {
+                open_settings(&mut settings_proc, &opts.config_path);
             }
         }
         let is_paused = paused.load(SeqCst);
