@@ -29,3 +29,14 @@
 ## Безопасность при разработке
 
 Прототипы в `prototypes/` двигают **только собственные тестовые окна**; чужие окна читаются, но не изменяются.
+
+## Быстрый старт
+
+```
+cargo build --release
+target\release\driftwin.exe --only notepad.exe     # безопасный режим: только окна из белого списка
+target\release\driftwinctl.exe msg state           # состояние демона через IPC
+```
+
+Конфиг — [config.example.toml](config.example.toml), справка по настройкам — [docs/CONFIG.md](docs/CONFIG.md).
+Аварийный выход, возвращающий окна на экран, — Win+Ctrl+Shift+R.
