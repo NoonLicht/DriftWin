@@ -5,6 +5,7 @@
 //! если пользователь задал их явно, выдаётся предупреждение «пока не поддерживается».
 
 pub mod catalog;
+pub mod deco;
 mod keys;
 mod rules;
 
@@ -18,6 +19,7 @@ use dw_core::action::{
 use dw_core::snap::SnapCfg;
 use serde::Deserialize;
 
+pub use deco::{Backdrop, BorderColor, Corner, Deco};
 pub use rules::{Matcher, Resolved, Rule};
 
 /// Какая клавиша играет роль `mod`.
@@ -149,6 +151,8 @@ pub struct Ipc {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Оформление окон по умолчанию (`[decorations]`).
+    pub decorations: Deco,
     pub session: Session,
     pub ipc: Ipc,
     pub monitors: Monitors,
@@ -209,7 +213,7 @@ struct RawConfig {
     background: RawBackground,
     snap: RawSnap,
     hot_corners: RawHotCorners,
-    decorations: Option<toml::Value>,
+    decorations: deco::RawDeco,
     effects: Option<toml::Value>,
     gestures: Option<toml::Value>,
     touch: Option<toml::Value>,
@@ -923,7 +927,6 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
         }
     }
     for (name, set) in [
-        ("decorations", raw.decorations.is_some()),
         ("effects", raw.effects.is_some()),
         ("gestures", raw.gestures.is_some()),
         ("touch", raw.touch.is_some()),
@@ -1019,6 +1022,10 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     let ipc = Ipc {
         expose_titles: raw.ipc.expose_titles.unwrap_or(true),
     };
+    let decorations = deco::compile(&raw.decorations).unwrap_or_else(|e| {
+        cx.err_at("[decorations]", format!("[decorations] {e}"));
+        Deco::default()
+    });
     let hc = &raw.hot_corners;
     let corner = |v: &Option<String>, name: &str, cx: &mut Ctx| -> Option<Action> {
         let src = v.as_deref()?;
@@ -1116,6 +1123,7 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             zoom,
             background,
             monitors,
+            decorations,
             session,
             ipc,
         },

@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::deco::{self, Deco};
+
 /// Шаблон: точная строка, glob (`*`, `?`) или регулярное выражение в `/…/`. Без учёта регистра.
 #[derive(Debug, Clone)]
 pub enum Matcher {
@@ -75,6 +77,10 @@ pub(crate) struct RawRule {
     pinned_to_screen: Option<bool>,
     suspend_on_close: Option<bool>,
     restore_windows: Option<bool>,
+    corner: Option<String>,
+    border_color: Option<String>,
+    backdrop: Option<String>,
+    opacity: Option<f64>,
     /// Остальные ключи: известные из плана без реализации или опечатки.
     #[serde(flatten)]
     extra: BTreeMap<String, toml::Value>,
@@ -87,9 +93,7 @@ const PLANNED: &[&str] = &[
     "preserve_aspect_ratio",
     "decoration",
     "blur",
-    "opacity",
     "border_width",
-    "border_color",
     "border_color_focused",
     "corner_radius",
     "shadow",
@@ -110,6 +114,7 @@ pub struct Rule {
     restore_windows: Option<bool>,
     position: Option<(f64, f64)>,
     size: Option<(i32, i32)>,
+    deco: Deco,
 }
 
 /// Итог применения всех подходящих правил.
@@ -123,6 +128,8 @@ pub struct Resolved {
     /// `None` — решает `[session]`.
     pub suspend_on_close: Option<bool>,
     pub restore_windows: Option<bool>,
+    /// Оформление из правил (без глобального `[decorations]`).
+    pub deco: Deco,
 }
 
 pub(crate) fn compile(r: &RawRule, idx: usize) -> Result<(Rule, Vec<String>), String> {
@@ -144,6 +151,13 @@ pub(crate) fn compile(r: &RawRule, idx: usize) -> Result<(Rule, Vec<String>), St
             "правило №{idx}: size [{w}, {h}] слишком мал (минимум 50x50)"
         ));
     }
+    let deco = deco::compile(&deco::RawDeco {
+        corner: r.corner.clone(),
+        border_color: r.border_color.clone(),
+        backdrop: r.backdrop.clone(),
+        opacity: r.opacity,
+    })
+    .map_err(|e| format!("правило №{idx}, {e}"))?;
     let mut warns = Vec::new();
     for k in r.extra.keys() {
         if PLANNED.contains(&k.as_str()) {
@@ -165,6 +179,7 @@ pub(crate) fn compile(r: &RawRule, idx: usize) -> Result<(Rule, Vec<String>), St
             restore_windows: r.restore_windows,
             position: r.position.map(|[x, y]| (x, y)),
             size: r.size.map(|[w, h]| (w, h)),
+            deco,
         },
         warns,
     ))
@@ -196,6 +211,7 @@ pub(crate) fn resolve(rules: &[Rule], exe: &str, class: &str, title: &str) -> Re
         if r.size.is_some() {
             out.size = r.size;
         }
+        out.deco = r.deco.over(out.deco);
     }
     out
 }

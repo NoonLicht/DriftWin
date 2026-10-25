@@ -98,6 +98,7 @@ pub(crate) struct Ext {
     pub counters: Counters,
     /// Когда последний раз левая кнопка была нажата на панели задач или её миниатюрах.
     pub taskbar_click: Option<Instant>,
+    pub deco: crate::deco::DecoState,
 }
 
 impl Ext {
@@ -122,6 +123,7 @@ impl Ext {
             state_txt: String::new(),
             counters: Counters::default(),
             taskbar_click: None,
+            deco: Default::default(),
         }
     }
 }
@@ -665,6 +667,7 @@ impl App {
     /// Выход: заглушки не оставляем, прозрачность возвращаем.
     pub(crate) fn shutdown_ext(&mut self) {
         self.save_session();
+        self.deco_restore_all();
         for id in self.ext.opacity.clone() {
             let mut set = true;
             let _ = dw_win::set_opacity(id, None, &mut set);
