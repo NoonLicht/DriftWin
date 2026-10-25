@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::*;
 
+use crate::pyramid::Pyramid;
 use crate::{BgCfg, BgKind, Kind, Shared, offset, screen_rect};
 
 /// Картинка фона в памяти GDI.
@@ -53,6 +54,33 @@ fn fit_pixels(w: u32, h: u32, max: u64) -> (u32, u32) {
         };
     }
     (nw, nh)
+}
+
+/// Что рисовать на фоне: картинка целиком или TIFF-пирамида (для огромных файлов).
+pub fn load_bg(bg: &BgCfg) -> (Option<Image>, Option<Pyramid>) {
+    if bg.kind == BgKind::Wallpaper
+        && let Some(path) = &bg.image
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+    {
+        match Pyramid::open(path) {
+            Ok(p) => {
+                let (w, h) = p.size();
+                // обычный маленький TIFF проще загрузить целиком
+                if p.levels.len() > 1 || u64::from(w) * u64::from(h) > MAX_BG_PIXELS {
+                    tracing::info!(
+                        "фон: TIFF {w}x{h}, уровней {} — плитки читаются по мере надобности",
+                        p.levels.len()
+                    );
+                    return (None, Some(p));
+                }
+            }
+            Err(e) => tracing::debug!("фон: {} не пирамида ({e})", path.display()),
+        }
+    }
+    (load_image(bg), None)
 }
 
 pub fn load_image(bg: &BgCfg) -> Option<Image> {
@@ -185,7 +213,7 @@ pub fn paint(hdc: HDC, s: &mut Shared) {
     }
 }
 
-fn paint_bg(hdc: HDC, s: &Shared) {
+fn paint_bg(hdc: HDC, s: &mut Shared) {
     let (w, h) = s.size;
     let full = RECT {
         left: 0,
@@ -208,7 +236,9 @@ fn paint_bg(hdc: HDC, s: &Shared) {
             }
         }
         BgKind::Wallpaper => {
-            if let Some(img) = &s.image {
+            if let Some(p) = s.pyramid.as_mut() {
+                paint_pyramid(hdc, p, (w, h), (ox, oy), z, s.bg.color);
+            } else if let Some(img) = &s.image {
                 let (iw, ih) = (f64::from(img.w) * z, f64::from(img.h) * z);
                 unsafe {
                     SetStretchBltMode(hdc, HALFTONE);
@@ -228,6 +258,73 @@ fn paint_bg(hdc: HDC, s: &Shared) {
                 }
             }
         }
+    }
+}
+
+/// Огромная картинка: уровень выбирается по масштабу, читаются только плитки, попавшие на вид.
+fn paint_pyramid(
+    hdc: HDC,
+    p: &mut Pyramid,
+    (w, h): (i32, i32),
+    (ox, oy): (f64, f64),
+    z: f64,
+    bg: [u8; 3],
+) {
+    let (iw, ih) = p.size();
+    let (dw, dh) = (f64::from(iw) * z, f64::from(ih) * z);
+    // картинка стоит центром в начале координат мира; видимая часть в пикселях экрана
+    let (dl, dt) = (ox - dw / 2.0, oy - dh / 2.0);
+    let vis = (
+        dl.max(0.0),
+        dt.max(0.0),
+        (dl + dw).min(f64::from(w)),
+        (dt + dh).min(f64::from(h)),
+    );
+    if vis.2 - vis.0 < 1.0 || vis.3 - vis.1 < 1.0 {
+        return;
+    }
+    let level = p.level_for(z.min(1.0));
+    // пикселей уровня на пиксель экрана
+    let k = p.level_scale(level) / z;
+    let src = (
+        ((vis.0 - dl) * k).floor() as i64,
+        ((vis.1 - dt) * k).floor() as i64,
+        ((vis.2 - dl) * k).ceil() as i64,
+        ((vis.3 - dt) * k).ceil() as i64,
+    );
+    let Some(buf) = p.read_bgra(level, src, bg) else {
+        return;
+    };
+    let (sw, sh) = ((src.2 - src.0) as i32, (src.3 - src.1) as i32);
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: sw,
+            biHeight: -sh,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    unsafe {
+        SetStretchBltMode(hdc, HALFTONE);
+        StretchDIBits(
+            hdc,
+            vis.0.round() as i32,
+            vis.1.round() as i32,
+            (vis.2 - vis.0).round() as i32,
+            (vis.3 - vis.1).round() as i32,
+            0,
+            0,
+            sw,
+            sh,
+            Some(buf.as_ptr().cast()),
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
     }
 }
 

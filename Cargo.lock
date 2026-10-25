@@ -604,6 +604,7 @@ version = "0.0.1"
 dependencies = [
  "dw-core",
  "image",
+ "tiff",
  "tracing",
  "windows",
 ]

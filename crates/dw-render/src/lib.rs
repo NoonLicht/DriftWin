@@ -7,6 +7,7 @@
 mod ghost;
 mod gpu;
 mod paint;
+mod pyramid;
 mod stub;
 
 use std::collections::HashMap;
@@ -149,6 +150,8 @@ struct Shared {
     scene: Scene,
     bg: BgCfg,
     image: Option<paint::Image>,
+    /// Огромный TIFF вместо `image`: плитки читаются по мере надобности.
+    pyramid: Option<pyramid::Pyramid>,
     /// Последняя позиция курсора при перетаскивании и было ли заметное смещение.
     drag: Option<(i32, i32, bool)>,
     /// Предыдущий клик по миниатюре (для двойного клика).
@@ -415,7 +418,7 @@ impl Overlay {
             )
             .map_err(|e| e.to_string())?
         };
-        let image = paint::load_image(&bg);
+        let (image, pyramid) = paint::load_bg(&bg);
         if let Ok(mut st) = STATE.lock() {
             st.push(Shared {
                 hwnd: hwnd.0 as isize,
@@ -430,6 +433,7 @@ impl Overlay {
                 },
                 bg,
                 image,
+                pyramid,
                 drag: None,
                 last_click: None,
                 back: None,
@@ -479,7 +483,7 @@ impl Overlay {
         let hwnd = self.hwnd;
         with_state(hwnd, |s| {
             if s.bg != bg {
-                s.image = paint::load_image(&bg);
+                (s.image, s.pyramid) = paint::load_bg(&bg);
                 s.bg = bg;
             }
         });
