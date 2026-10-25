@@ -358,6 +358,15 @@ pub fn focus(m: &Managed) -> bool {
             input_tap();
             let _ = SetForegroundWindow(h);
         }
+        // при отказе ОС мигает кнопкой окна, а автоскрывающаяся панель задач из-за этого выезжает
+        let stop = FLASHWINFO {
+            cbSize: size_of::<FLASHWINFO>() as u32,
+            hwnd: h,
+            dwFlags: FLASHW_STOP,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        let _ = FlashWindowEx(&stop);
         GetForegroundWindow() == h
     }
 }

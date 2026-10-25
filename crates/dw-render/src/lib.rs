@@ -4,6 +4,7 @@
 //! `Desktop` — внизу z-порядка, рисует фон под обычными окнами. Окна не берут фокус.
 //! Все вызовы — из потока, который качает сообщения (в демоне это главный поток).
 
+mod chrome;
 mod ghost;
 mod gpu;
 mod paint;
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+pub use chrome::{Chrome, WIDTH as CHROME_WIDTH};
 pub use ghost::{GhostItem, Ghosts};
 pub use gpu::Hub;
 pub use stub::{
@@ -42,6 +44,10 @@ pub enum BgKind {
     None,
     Solid,
     Grid,
+    /// Градиент и мягкие цветные пятна, рисуются кодом без картинок.
+    Aurora,
+    /// Фрактальный шум в пастельных цветах; только шейдером (режим `capture`), в режиме миниатюр рисуется как `Aurora`.
+    Fractal,
     /// Картинка, повторяющаяся по всей плоскости.
     Tile,
     /// Одна картинка в начале координат мира.
@@ -111,6 +117,10 @@ pub enum Event {
     StubLaunch(u64),
     /// Кнопка закрытия заглушки: убрать её.
     StubClose(u64),
+    /// Кнопка «свернуть» окна, открытого на весь экран: вернуться в обзор.
+    ChromeMinimize,
+    /// Кнопка «закрыть» окна, открытого на весь экран.
+    ChromeClose,
     /// Сырое событие мыши на оверлее бэкенда `capture`: сообщение Windows (`WM_*`), позиция в координатах общего вида,
     /// `wp` — `wParam` (клавиши-модификаторы; у колеса старшее слово — дельта).
     Mouse { msg: u32, x: i32, y: i32, wp: usize },
@@ -152,6 +162,8 @@ struct Shared {
     image: Option<paint::Image>,
     /// Огромный TIFF вместо `image`: плитки читаются по мере надобности.
     pyramid: Option<pyramid::Pyramid>,
+    /// Спрайты пятен фона `aurora` (создаются при первой отрисовке).
+    aurora: Vec<paint::Image>,
     /// Последняя позиция курсора при перетаскивании и было ли заметное смещение.
     drag: Option<(i32, i32, bool)>,
     /// Предыдущий клик по миниатюре (для двойного клика).
@@ -434,6 +446,7 @@ impl Overlay {
                 bg,
                 image,
                 pyramid,
+                aurora: Vec::new(),
                 drag: None,
                 last_click: None,
                 back: None,
@@ -450,9 +463,14 @@ impl Overlay {
         })
     }
 
-    /// Оверлей обзора для бэкенда `capture`: окна рисует GPU, мышь приходит как `Event::Mouse`.
-    pub fn new_capture(rect: (i32, i32, i32, i32), bg: BgCfg, hub: &Hub) -> Result<Self, String> {
-        let mut o = Self::new(Kind::Overview, rect, bg)?;
+    /// Оверлей для бэкенда `capture`: фон (а в обзоре и окна) рисует GPU, мышь приходит как `Event::Mouse`.
+    pub fn new_capture(
+        kind: Kind,
+        rect: (i32, i32, i32, i32),
+        bg: BgCfg,
+        hub: &Hub,
+    ) -> Result<Self, String> {
+        let mut o = Self::new(kind, rect, bg)?;
         let surface = gpu::Surface::new(hub, o.hwnd.0 as isize, (rect.2, rect.3))?;
         let hwnd = o.hwnd;
         with_state(hwnd, |s| s.surface = Some(surface));
@@ -473,6 +491,18 @@ impl Overlay {
         {
             self.repaint();
         }
+    }
+
+    /// Все снимаемые сейчас окна уже прислали первый кадр (иначе при показе мелькнут серые заглушки).
+    pub fn frames_ready(&self) -> bool {
+        self.hub
+            .as_ref()
+            .is_some_and(|h| h.active() > 0 && h.active() == h.with_frames())
+    }
+
+    /// Рисует ли оверлей на GPU (бэкенд `capture`).
+    pub fn is_capture(&self) -> bool {
+        self.hub.is_some()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -517,7 +547,7 @@ impl Overlay {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
-        if let Some(h) = &self.hub {
+        if let Some(h) = self.hub.as_ref().filter(|_| self.kind == Kind::Overview) {
             h.sync(&[]);
         }
         // следующая сцена обязательно отличается: миниатюры придётся регистрировать заново
@@ -544,15 +574,18 @@ impl Overlay {
         if self.visible && with_state(hwnd, |s| s.scene == *scene).unwrap_or(false) {
             return;
         }
-        if let Some(h) = &self.hub {
+        // фоновый (Desktop) оверлей окон не показывает и захваты не трогает: общий Hub принадлежит обзору
+        if let Some(h) = self.hub.as_ref().filter(|_| self.kind == Kind::Overview) {
             // снимаем только окна, которые попадают на вид
             let (vw, vh) = scene.view;
             let shown: Vec<(u64, isize)> = scene
                 .items
                 .iter()
                 .filter(|it| {
+                    // запас в пол-экрана: окно, въезжающее в кадр, не должно мелькнуть серой заглушкой
                     let r = screen_rect(scene, (0, 0), &it.rect);
-                    r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh
+                    let (mx, my) = (vw / 2, vh / 2);
+                    r.right > -mx && r.bottom > -my && r.left < vw + mx && r.top < vh + my
                 })
                 .map(|it| (it.key, it.hwnd))
                 .collect();

@@ -70,7 +70,7 @@ step = 1.25                  # шаг zoom-in / zoom-out / колеса в об�
 
 # Фон холста: виден в обзоре (и под окнами, если on_desktop = true)
 [background]
-type = "default"             # default | grid | solid | tile | wallpaper | none
+type = "default"             # default | grid | solid | aurora | fractal | tile | wallpaper | none
 color = "#181a20"
 grid_color = "#303440"
 grid_size = 100              # шаг сетки в мире, px

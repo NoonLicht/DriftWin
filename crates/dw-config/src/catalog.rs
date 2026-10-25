@@ -415,7 +415,16 @@ pub const SETTINGS: &[Setting] = &[
     s(
         "background",
         "type",
-        Kind::Choice(&["default", "grid", "solid", "tile", "wallpaper", "none"]),
+        Kind::Choice(&[
+            "default",
+            "grid",
+            "solid",
+            "aurora",
+            "fractal",
+            "tile",
+            "wallpaper",
+            "none",
+        ]),
         Def::Str("default"),
         "Тип фона",
         "default и grid — сетка; tile — повторяющаяся картинка; wallpaper — одна картинка в начале координат.",

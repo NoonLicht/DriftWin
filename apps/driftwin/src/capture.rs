@@ -34,7 +34,11 @@ const MK_CONTROL: usize = 0x8;
 
 impl App {
     /// Оверлей `capture`; при неудаче (нет D3D11/WGC) вызывающий вернётся к миниатюрам.
-    pub(crate) fn capture_overlay(&mut self, rect: (i32, i32, i32, i32)) -> Option<Overlay> {
+    pub(crate) fn capture_overlay(
+        &mut self,
+        kind: dw_render::Kind,
+        rect: (i32, i32, i32, i32),
+    ) -> Option<Overlay> {
         if self.ext.cap.hub.is_none() {
             match dw_render::Hub::new() {
                 Ok(h) => self.ext.cap.hub = Some(h),
@@ -45,7 +49,7 @@ impl App {
             }
         }
         let hub = self.ext.cap.hub.as_ref()?;
-        match Overlay::new_capture(rect, self.bg_cfg(), hub) {
+        match Overlay::new_capture(kind, rect, self.bg_cfg(), hub) {
             Ok(o) => Some(o),
             Err(e) => {
                 tracing::warn!("оверлей capture не создан ({e}), обзор рисуется миниатюрами");

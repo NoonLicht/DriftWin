@@ -116,6 +116,10 @@ pub enum BgType {
     None,
     Solid,
     Grid,
+    /// Процедурный фон: градиент и мягкие цветные пятна, без картинок.
+    Aurora,
+    /// Фрактальный пастельный шум (шейдер режима `capture`; в режиме миниатюр — как aurora).
+    Fractal,
     Tile,
     Wallpaper,
 }
@@ -718,6 +722,8 @@ fn compile_background(b: &RawBackground, cx: &mut Ctx) -> Background {
     let kind = match b.kind.as_deref().unwrap_or("default") {
         "default" | "grid" => BgType::Grid,
         "solid" => BgType::Solid,
+        "aurora" => BgType::Aurora,
+        "fractal" => BgType::Fractal,
         "none" => BgType::None,
         "tile" => BgType::Tile,
         "wallpaper" => BgType::Wallpaper,
@@ -731,7 +737,7 @@ fn compile_background(b: &RawBackground, cx: &mut Ctx) -> Background {
         o => {
             cx.err_at(
                 "type",
-                format!("background.type = «{o}»: допустимо default, grid, solid, tile, wallpaper, none, shader"),
+                format!("background.type = «{o}»: допустимо default, grid, solid, aurora, fractal, tile, wallpaper, none, shader"),
             );
             BgType::Grid
         }

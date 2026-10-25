@@ -230,6 +230,11 @@ fn paint_bg(hdc: HDC, s: &mut Shared) {
     match s.bg.kind {
         BgKind::None | BgKind::Solid => {}
         BgKind::Grid => paint_grid(hdc, s, ox, oy, z),
+        // фрактал считается только шейдером (режим capture); здесь запасной aurora
+        BgKind::Aurora | BgKind::Fractal => {
+            let (a, hh) = aurora_origin(&s.scene, (offx, offy), (ox, oy));
+            paint_aurora(hdc, &mut s.aurora, s.bg.color, (w, h), a, hh);
+        }
         BgKind::Tile => {
             if let Some(img) = &s.image {
                 paint_tile(hdc, img, s, ox, oy, z);
@@ -254,6 +259,155 @@ fn paint_bg(hdc: HDC, s: &mut Shared) {
                         img.w,
                         img.h,
                         SRCCOPY,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Мягкие цветные пятна фона `aurora`: положение (в высотах вида, Y вниз), радиус (тоже в высотах), цвет, густота в центре.
+/// Те же числа продублированы в шейдере `gpu.rs`.
+pub(crate) const GLOWS: [(f64, f64, f64, [u8; 3], f64); 3] = [
+    (-0.55, -0.25, 0.85, [77, 89, 242], 0.32),
+    (0.55, 0.25, 0.75, [26, 166, 179], 0.24),
+    (0.0, 0.6, 0.65, [191, 77, 179], 0.18),
+];
+/// Пятна повторяются с этим периодом (в высотах вида), чтобы фон не кончался при панорамировании.
+pub(crate) const AURORA_PERIOD: (f64, f64) = (2.6, 1.7);
+/// Во сколько раз фон смещается медленнее холста (глубина).
+pub(crate) const AURORA_PARALLAX: f64 = 0.25;
+
+/// Точка отсчёта пятен на оверлее (с параллаксом) и высота вида — единица длины для пятен.
+pub(crate) fn aurora_origin(
+    scene: &crate::Scene,
+    (offx, offy): (i32, i32),
+    (ox, oy): (f64, f64),
+) -> ((f64, f64), f64) {
+    let cx = f64::from(scene.view.0) / 2.0 - f64::from(offx);
+    let cy = f64::from(scene.view.1) / 2.0 - f64::from(offy);
+    (
+        (
+            cx + (ox - cx) * AURORA_PARALLAX,
+            cy + (oy - cy) * AURORA_PARALLAX,
+        ),
+        f64::from(scene.view.1.max(1)),
+    )
+}
+
+/// Спрайт одного пятна: предумноженный BGRA, плавный спад `(1 - t²)²` до нуля на краю.
+fn glow_sprite(rgb: [u8; 3], a: f64) -> Option<Image> {
+    const N: i32 = 128;
+    let mut px = vec![0u8; (N * N * 4) as usize];
+    for (i, d) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let (u, v) = (
+            ((i as i32 % N) as f64 + 0.5) / f64::from(N) * 2.0 - 1.0,
+            ((i as i32 / N) as f64 + 0.5) / f64::from(N) * 2.0 - 1.0,
+        );
+        let t2 = (u * u + v * v).min(1.0);
+        let al = a * (1.0 - t2) * (1.0 - t2);
+        let m = |c: u8| (f64::from(c) * al).round() as u8;
+        *d = [m(rgb[2]), m(rgb[1]), m(rgb[0]), (al * 255.0).round() as u8];
+    }
+    unsafe {
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(Some(screen));
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: N,
+                biHeight: -N,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bmp = CreateDIBSection(Some(screen), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+        ReleaseDC(None, screen);
+        let bmp = bmp.ok()?;
+        if bits.is_null() {
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(px.as_ptr(), bits.cast::<u8>(), px.len());
+        SelectObject(dc, bmp.into());
+        Some(Image {
+            dc,
+            bmp,
+            w: N,
+            h: N,
+            avg: rgb,
+        })
+    }
+}
+
+/// Процедурный фон: вертикальный градиент основного цвета и три мягких пятна. Ни одной картинки, спрайты по 64 КБ.
+fn paint_aurora(
+    hdc: HDC,
+    sprites: &mut Vec<Image>,
+    base: [u8; 3],
+    (w, h): (i32, i32),
+    (ax, ay): (f64, f64),
+    hh: f64,
+) {
+    let tone = |c: u8, k: f64| ((f64::from(c) * k).min(255.0).round() as u16) << 8;
+    let vertex = |y: i32, k: f64| TRIVERTEX {
+        x: if y == 0 { 0 } else { w },
+        y: if y == 0 { 0 } else { h },
+        Red: tone(base[0], k),
+        Green: tone(base[1], k),
+        Blue: tone(base[2], k),
+        Alpha: 0,
+    };
+    let verts = [vertex(0, 1.18), vertex(1, 0.82)];
+    let mesh = GRADIENT_RECT {
+        UpperLeft: 0,
+        LowerRight: 1,
+    };
+    unsafe {
+        let _ = GradientFill(
+            hdc,
+            &verts,
+            (&raw const mesh).cast(),
+            1,
+            GRADIENT_FILL_RECT_V,
+        );
+    }
+    if sprites.is_empty() {
+        *sprites = GLOWS.iter().filter_map(|g| glow_sprite(g.3, g.4)).collect();
+    }
+    if sprites.len() != GLOWS.len() {
+        return;
+    }
+    let (px, py) = (AURORA_PERIOD.0 * hh, AURORA_PERIOD.1 * hh);
+    let bf = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1,
+    };
+    for (g, spr) in GLOWS.iter().zip(sprites.iter()) {
+        let (gx, gy, r) = (ax + g.0 * hh, ay + g.1 * hh, g.2 * hh);
+        let kx = (((-r - gx) / px).ceil() as i32)..=(((f64::from(w) + r - gx) / px).floor() as i32);
+        let ky = (((-r - gy) / py).ceil() as i32)..=(((f64::from(h) + r - gy) / py).floor() as i32);
+        for j in ky {
+            for i in kx.clone() {
+                let (x, y) = (gx + f64::from(i) * px - r, gy + f64::from(j) * py - r);
+                unsafe {
+                    let _ = AlphaBlend(
+                        hdc,
+                        x.round() as i32,
+                        y.round() as i32,
+                        (2.0 * r).round() as i32,
+                        (2.0 * r).round() as i32,
+                        spr.dc,
+                        0,
+                        0,
+                        spr.w,
+                        spr.h,
+                        bf,
                     );
                 }
             }
