@@ -27,6 +27,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod capture;
 mod deco;
 mod onboarding;
 mod shot;
@@ -655,7 +656,12 @@ impl App {
         for (n, (x, y)) in &new.navigation.bookmarks {
             self.bookmarks.entry(*n).or_insert(Vec2::new(*x, *y));
         }
+        let backend_changed = new.zoom.backend != self.cfg.zoom.backend;
         self.cfg = new;
+        if backend_changed {
+            self.leave_overview_now();
+            self.create_overlays();
+        }
         self.apply_geometry();
         self.apply_background();
         tracing::info!("конфиг применён");
@@ -742,7 +748,17 @@ impl App {
         }
     }
 
-    fn new_overlay(&self, kind: dw_render::Kind, rect: (i32, i32, i32, i32)) -> Option<Overlay> {
+    fn new_overlay(
+        &mut self,
+        kind: dw_render::Kind,
+        rect: (i32, i32, i32, i32),
+    ) -> Option<Overlay> {
+        if kind == dw_render::Kind::Overview
+            && self.cfg.zoom.backend == dw_config::ZoomBackend::Capture
+            && let Some(o) = self.capture_overlay(rect)
+        {
+            return Some(o);
+        }
         match Overlay::new(kind, rect, self.bg_cfg()) {
             Ok(o) => Some(o),
             Err(e) => {
@@ -755,11 +771,10 @@ impl App {
     /// Оверлеи обзора по одному на управляемый монитор.
     fn create_overlays(&mut self) {
         self.desk_bgs.clear();
-        self.overlays = self
-            .geo
-            .sel
-            .iter()
-            .filter_map(|m| self.new_overlay(dw_render::Kind::Overview, m.rect))
+        let rects: Vec<_> = self.geo.sel.iter().map(|m| m.rect).collect();
+        self.overlays = rects
+            .into_iter()
+            .filter_map(|r| self.new_overlay(dw_render::Kind::Overview, r))
             .collect();
         self.apply_background();
     }
@@ -778,11 +793,10 @@ impl App {
                 d.set_bg(bg.clone());
             }
         } else {
-            self.desk_bgs = self
-                .geo
-                .sel
-                .iter()
-                .filter_map(|m| self.new_overlay(dw_render::Kind::Desktop, m.rect))
+            let rects: Vec<_> = self.geo.sel.iter().map(|m| m.rect).collect();
+            self.desk_bgs = rects
+                .into_iter()
+                .filter_map(|r| self.new_overlay(dw_render::Kind::Desktop, r))
                 .collect();
         }
         self.bg_center = None;
@@ -912,6 +926,7 @@ impl App {
                     if !visible {
                         o.show();
                     }
+                    o.pump();
                 }
             } else if self.hide_in == 0 {
                 self.hide_in = 3;
@@ -1061,6 +1076,7 @@ impl App {
                 self.target = Vec2::new(px - sx / nz, py + sy / nz);
             }
             Event::Back => self.leave_overview(),
+            Event::Mouse { msg, x, y, wp } => self.capture_mouse(msg, x, y, wp),
             Event::GhostClick(_) | Event::StubLaunch(_) | Event::StubClose(_) => {}
         }
     }

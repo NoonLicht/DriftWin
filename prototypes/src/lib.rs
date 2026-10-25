@@ -20,7 +20,51 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             let _ = windows::Win32::Graphics::Gdi::DeleteObject(br.into());
             return LRESULT(1);
         }
+        count_input(h, m, lp);
         DefWindowProcW(h, m, wp, lp)
+    }
+}
+
+/// Тестовые окна считают входящий ввод и показывают счётчики в заголовке (`L` левые клики, `R` правые, `W` колесо,
+/// `K` клавиши, `@x,y` последняя позиция мыши в клиентской области): так видно, что пересылка ввода дошла.
+fn count_input(h: HWND, m: u32, lp: LPARAM) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type Counters = (String, [u32; 4], (i32, i32));
+    static STATE: Mutex<Option<HashMap<isize, Counters>>> = Mutex::new(None);
+    let slot = match m {
+        WM_LBUTTONDOWN => 0,
+        WM_RBUTTONDOWN => 1,
+        WM_MOUSEWHEEL => 2,
+        WM_KEYDOWN | WM_CHAR => 3,
+        WM_MOUSEMOVE => 4,
+        _ => return,
+    };
+    let mut g = STATE.lock().unwrap();
+    let e = g
+        .get_or_insert_with(HashMap::new)
+        .entry(h.0 as isize)
+        .or_insert_with(|| {
+            let mut b = [0u16; 128];
+            let n = unsafe { GetWindowTextW(h, &mut b) } as usize;
+            (String::from_utf16_lossy(&b[..n]), [0; 4], (0, 0))
+        });
+    if slot < 4 {
+        e.1[slot] += 1;
+    }
+    if slot == 0 || slot == 4 {
+        e.2 = (
+            (lp.0 & 0xFFFF) as i16 as i32,
+            ((lp.0 >> 16) & 0xFFFF) as i16 as i32,
+        );
+    }
+    let t = format!(
+        "{} L={} R={} W={} K={} @{},{}",
+        e.0, e.1[0], e.1[1], e.1[2], e.1[3], e.2.0, e.2.1
+    );
+    let t: Vec<u16> = t.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let _ = SetWindowTextW(h, PCWSTR(t.as_ptr()));
     }
 }
 
