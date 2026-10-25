@@ -78,12 +78,27 @@ fn geometry(cfg: &dw_config::Config) -> Geometry {
     }
 }
 
-/// Стены изоляции: прямоугольники (x, y, ширина, высота) неуправляемых мониторов.
-type Walls = Vec<(i32, i32, i32, i32)>;
-
-/// Прямоугольник целиком лежит внутри `f`.
-fn rect_inside(r: &ScreenRect, f: &(i32, i32, i32, i32)) -> bool {
-    r.x >= f.0 && r.y >= f.1 && r.x + r.w <= f.0 + f.2 && r.y + r.h <= f.1 + f.3
+/// Самая большая прямоугольная часть `r`, не перекрытая стенами (x, y, ширина, высота):
+/// (left, top, right, bottom). `None` — окно целиком под стенами.
+fn visible_part(r: &ScreenRect, walls: &[(i32, i32, i32, i32)]) -> Option<(i32, i32, i32, i32)> {
+    let mut cur = (r.x, r.y, r.x + r.w, r.y + r.h);
+    for w in walls {
+        let (wx0, wy0, wx1, wy1) = (w.0, w.1, w.0 + w.2, w.1 + w.3);
+        if wx0 >= cur.2 || wx1 <= cur.0 || wy0 >= cur.3 || wy1 <= cur.1 {
+            continue;
+        }
+        let strips = [
+            (cur.0, cur.1, wx0, cur.3),
+            (wx1, cur.1, cur.2, cur.3),
+            (cur.0, cur.1, cur.2, wy0),
+            (cur.0, wy1, cur.2, cur.3),
+        ];
+        cur = strips
+            .into_iter()
+            .filter(|s| s.2 > s.0 && s.3 > s.1)
+            .max_by_key(|s| i64::from(s.2 - s.0) * i64::from(s.3 - s.1))?;
+    }
+    Some(cur)
 }
 
 fn rect_hit(r: &ScreenRect, f: &(i32, i32, i32, i32)) -> bool {
@@ -365,8 +380,8 @@ struct App {
     /// Фон под окнами рабочего стола (`[background] on_desktop`), по одному на монитор.
     desk_bgs: Vec<Overlay>,
     geo: Geometry,
-    /// Окна, к которым применена обрезка изоляции.
-    clipped: std::collections::HashSet<WindowId>,
+    /// «Призраки» окон у границы неуправляемых мониторов.
+    ghosts: dw_render::Ghosts,
     bg_center: Option<Vec2>,
     /// Сколько кадров ещё держать оверлей после возврата к масштабу 1.0 (пока окна встают на места).
     hide_in: u8,
@@ -429,7 +444,6 @@ impl App {
             .collect();
         for id in dead {
             self.managed.remove(&id);
-            self.clipped.remove(&id);
             self.canvas.forget(id);
             self.mru.remove(id);
             self.last.remove(&id);
@@ -570,6 +584,7 @@ impl App {
         self.undo.clear();
         self.size_checks.clear();
         self.leave_overview_now();
+        self.ghosts.clear();
     }
 
     // ---------- масштаб и обзор ----------
@@ -713,9 +728,6 @@ impl App {
                 "окно «{}» ушло на неуправляемый монитор — отпущено",
                 m.title
             );
-        }
-        if self.clipped.remove(&id) {
-            dw_win::clip_clear(id);
         }
         self.canvas.forget(id);
         self.mru.remove(id);
@@ -888,6 +900,14 @@ impl App {
     /// События мыши на оверлее обзора.
     fn overlay_event(&mut self, ev: dw_render::Event) {
         use dw_render::Event;
+        if let Event::GhostClick(key) = ev {
+            // клик по видимой части окна у границы: подвести к нему вид
+            let id = WindowId(key);
+            if self.canvas.contains(id) {
+                self.go_to(id);
+            }
+            return;
+        }
         if !self.in_overview() {
             return;
         }
@@ -926,6 +946,7 @@ impl App {
                 self.target = Vec2::new(px - sx / nz, py + sy / nz);
             }
             Event::Back => self.leave_overview(),
+            Event::GhostClick(_) => {}
         }
     }
 
@@ -989,26 +1010,45 @@ impl App {
             Some(Drag::Resize { id, .. }) => vec![*id],
             _ => vec![],
         };
-        // изоляция: окно целиком над неуправляемым монитором прячется далеко за экранами,
-        // перекрывающее его частично — обрезается (см. ниже)
+        // изоляция: окно, перекрывающее неуправляемый монитор, паркуется за экранами; если часть окна
+        // остаётся на управляемом мониторе, на её месте показывается «призрак» — живая миниатюра этой части
+        let mut ghost_items: Vec<dw_render::GhostItem> = Vec::new();
         let layout: Vec<(WindowId, ScreenRect)> = self
             .canvas
             .layout()
             .into_iter()
             .map(|(id, r)| {
-                let walled = !self.canvas.is_pinned(id)
-                    && !dragged.contains(&id)
-                    && self.geo.forbidden.iter().any(|f| rect_inside(&r, f));
-                let r = if walled {
+                if self.canvas.is_pinned(id) || dragged.contains(&id) {
+                    return (id, r);
+                }
+                let walls: Vec<_> = self
+                    .geo
+                    .forbidden
+                    .iter()
+                    .filter(|f| rect_hit(&r, f))
+                    .copied()
+                    .collect();
+                if walls.is_empty() {
+                    return (id, r);
+                }
+                if let (Some(m), Some(part)) = (self.managed.get(&id), visible_part(&r, &walls)) {
+                    // координаты части в окне, включая невидимые рамки
+                    let (left, top) = (r.x - m.border.l, r.y - m.border.t);
+                    ghost_items.push(dw_render::GhostItem {
+                        key: id.0,
+                        hwnd: id.0 as isize,
+                        dest: (part.0, part.1, part.2 - part.0, part.3 - part.1),
+                        src: (part.0 - left, part.1 - top, part.2 - left, part.3 - top),
+                    });
+                }
+                (
+                    id,
                     ScreenRect {
                         x: PARK_AT,
                         y: PARK_AT,
                         ..r
-                    }
-                } else {
-                    r
-                };
-                (id, r)
+                    },
+                )
             })
             .collect();
         let items: Vec<_> = layout
@@ -1031,22 +1071,7 @@ impl App {
             .collect();
         let mut moved: Vec<(&Managed, ScreenRect)> = Vec::new();
         let mut sized: Vec<(&Managed, ScreenRect)> = Vec::new();
-        let mut clipped_now: Vec<(&Managed, ScreenRect, Walls)> = Vec::new();
         for &(m, r) in &items {
-            let walls: Vec<_> = self
-                .geo
-                .forbidden
-                .iter()
-                .filter(|f| rect_hit(&r, f))
-                .copied()
-                .collect();
-            if !walls.is_empty() {
-                clipped_now.push((m, r, walls));
-                continue;
-            }
-            if self.clipped.remove(&m.id) {
-                dw_win::clip_clear(m.id);
-            }
             if self
                 .last
                 .get(&m.id)
@@ -1059,10 +1084,7 @@ impl App {
         }
         dw_win::apply(&moved);
         dw_win::apply_sized(&sized);
-        for (m, r, walls) in &clipped_now {
-            dw_win::clip_apply(m, *r, walls);
-            self.clipped.insert(m.id);
-        }
+        self.ghosts.update(&ghost_items);
         for (m, r) in items {
             self.last.insert(m.id, r);
         }
@@ -1925,7 +1947,7 @@ fn main() -> Result<()> {
         overlays: Vec::new(),
         desk_bgs: Vec::new(),
         geo,
-        clipped: Default::default(),
+        ghosts: dw_render::Ghosts::new(),
         bg_center: None,
         hide_in: 0,
     };
@@ -1976,6 +1998,7 @@ fn main() -> Result<()> {
             was_paused = is_paused;
             if is_paused {
                 app.leave_overview_now();
+                app.ghosts.clear();
             }
             if !is_paused {
                 app.reset();
@@ -2018,4 +2041,40 @@ fn main() -> Result<()> {
     tracing::info!("выход: возвращено окон {n}");
     std::fs::write(&clean, b"ok")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> ScreenRect {
+        ScreenRect { x, y, w, h }
+    }
+
+    #[test]
+    fn visible_part_trims_walls() {
+        // стена справа от основного монитора (x >= 3440): видна левая часть окна
+        let wall = (3440, -239, 1080, 1920);
+        assert_eq!(
+            visible_part(&r(3200, 300, 340, 240), &[wall]),
+            Some((3200, 300, 3440, 540))
+        );
+        // окно целиком под стеной
+        assert_eq!(visible_part(&r(3500, 300, 340, 240), &[wall]), None);
+        // стена не пересекается — окно целиком
+        assert_eq!(
+            visible_part(&r(100, 100, 300, 200), &[wall]),
+            Some((100, 100, 400, 300))
+        );
+    }
+
+    #[test]
+    fn visible_part_keeps_largest_strip() {
+        // стена сверху (монитор над основным): остаётся нижняя полоса окна
+        let top = (782, -1080, 1920, 1080);
+        assert_eq!(
+            visible_part(&r(2500, -50, 400, 300), &[top]),
+            Some((2500, 0, 2900, 250))
+        );
+    }
 }

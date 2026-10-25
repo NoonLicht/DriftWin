@@ -4,11 +4,14 @@
 //! `Desktop` — внизу z-порядка, рисует фон под обычными окнами. Окна не берут фокус.
 //! Все вызовы — из потока, который качает сообщения (в демоне это главный поток).
 
+mod ghost;
 mod paint;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+pub use ghost::{GhostItem, Ghosts};
 
 use dw_core::{Rect, Vec2};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -95,6 +98,8 @@ pub enum Event {
     Wheel { steps: f64, x: i32, y: i32 },
     /// Правый клик: выйти из обзора.
     Back,
+    /// Клик по «призраку» окна у границы неуправляемого монитора.
+    GhostClick(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,9 +10,9 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, DEVMODEW, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors,
-    EnumDisplaySettingsW, GetMonitorInfoW, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MONITORINFOEXW, MonitorFromPoint, RGN_DIFF, SetWindowRgn,
+    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
+    HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
+    SetWindowRgn,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::*;
@@ -377,52 +377,7 @@ pub fn apply(items: &[(&Managed, ScreenRect)]) {
 
 const CLIP_PROP: windows::core::PCWSTR = windows::core::w!("DriftWinClip");
 
-/// Поставить окно в `r` и обрезать его так, чтобы часть, лежащая в `walls` (x, y, ширина, высота на экране),
-/// не была видна. Синхронно: положение и область обрезки должны меняться согласованно.
-pub fn clip_apply(m: &Managed, r: ScreenRect, walls: &[(i32, i32, i32, i32)]) {
-    let h = hwnd_of(m.id);
-    let x = (r.x - m.border.l).clamp(-PARK_LIMIT, PARK_LIMIT);
-    let y = (r.y - m.border.t).clamp(-PARK_LIMIT, PARK_LIMIT);
-    unsafe {
-        let _ = SetWindowPos(
-            h,
-            None,
-            x,
-            y,
-            0,
-            0,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOSENDCHANGING,
-        );
-        let wr = window_rect(h);
-        let (w, hh) = (wr.right - wr.left, wr.bottom - wr.top);
-        let rgn = CreateRectRgn(0, 0, w, hh);
-        for f in walls {
-            let (l, t) = ((f.0 - wr.left).clamp(0, w), (f.1 - wr.top).clamp(0, hh));
-            let (rr, b) = (
-                (f.0 + f.2 - wr.left).clamp(0, w),
-                (f.1 + f.3 - wr.top).clamp(0, hh),
-            );
-            if rr > l && b > t {
-                let wall = CreateRectRgn(l, t, rr, b);
-                CombineRgn(Some(rgn), Some(rgn), Some(wall), RGN_DIFF);
-                let _ = DeleteObject(HGDIOBJ(wall.0));
-            }
-        }
-        // система забирает область себе
-        SetWindowRgn(h, Some(rgn), true);
-        let _ = SetPropW(
-            h,
-            CLIP_PROP,
-            Some(windows::Win32::Foundation::HANDLE(std::ptr::dangling_mut())),
-        );
-    }
-}
-
-/// Снять обрезку, если она была наложена DriftWin.
-pub fn clip_clear(id: WindowId) {
-    clear_clip_hwnd(hwnd_of(id));
-}
-
+/// Снять область обрезки, наложенную прежними версиями DriftWin (признак — свойство окна `DriftWinClip`).
 fn clear_clip_hwnd(h: HWND) {
     unsafe {
         if IsWindow(Some(h)).as_bool() && !GetPropW(h, CLIP_PROP).is_invalid() {
