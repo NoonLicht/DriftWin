@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 dw-core.workspace = true
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
 tracing.workspace = true
 
 [dependencies.windows]

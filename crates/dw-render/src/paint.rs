@@ -29,6 +29,32 @@ impl Drop for Image {
     }
 }
 
+/// Сколько пикселей картинки фона держим в памяти (RGBA: 40 Мпикс — 160 МБ). Большие (панорамы, гигапиксельные снимки)
+/// уменьшаются при загрузке с сохранением пропорций.
+const MAX_BG_PIXELS: u64 = 40_000_000;
+
+/// Размер, вписанный в `max` пикселей с теми же пропорциями; не больше исходного.
+fn fit_pixels(w: u32, h: u32, max: u64) -> (u32, u32) {
+    let n = u64::from(w) * u64::from(h);
+    if n <= max {
+        return (w, h);
+    }
+    let k = (max as f64 / n as f64).sqrt();
+    let (nw, nh) = (
+        ((f64::from(w) * k).floor() as u32).max(1),
+        ((f64::from(h) * k).floor() as u32).max(1),
+    );
+    // у очень вытянутых картинок сторона в 1 px раздувает вторую: дожимаем
+    if u64::from(nw) * u64::from(nh) > max {
+        return if nw == 1 {
+            (1, (max as u32).max(1))
+        } else {
+            ((max as u32).max(1), 1)
+        };
+    }
+    (nw, nh)
+}
+
 pub fn load_image(bg: &BgCfg) -> Option<Image> {
     if !matches!(bg.kind, BgKind::Tile | BgKind::Wallpaper) {
         return None;
@@ -41,10 +67,21 @@ pub fn load_image(bg: &BgCfg) -> Option<Image> {
             return None;
         }
     };
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    if w == 0 || h == 0 {
+    if img.width() == 0 || img.height() == 0 {
         return None;
     }
+    let (fw, fh) = fit_pixels(img.width(), img.height(), MAX_BG_PIXELS);
+    let img = if (fw, fh) != (img.width(), img.height()) {
+        tracing::info!(
+            "фон: {}x{} велико, уменьшено до {fw}x{fh}",
+            img.width(),
+            img.height()
+        );
+        image::imageops::resize(&img, fw, fh, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let (w, h) = (img.width() as i32, img.height() as i32);
     unsafe {
         let screen = GetDC(None);
         let dc = CreateCompatibleDC(Some(screen));
@@ -344,5 +381,19 @@ fn paint_items(hdc: HDC, s: &Shared) {
         }
         SelectObject(hdc, old);
         let _ = DeleteObject(font.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_pixels_keeps_aspect_and_cap() {
+        assert_eq!(fit_pixels(1000, 500, 40_000_000), (1000, 500));
+        let (w, h) = fit_pixels(40_000, 20_000, 40_000_000);
+        assert!(u64::from(w) * u64::from(h) <= 40_000_000);
+        assert_eq!(w / h, 2);
+        assert_eq!(fit_pixels(1, 1_000_000_000, 10), (1, 10));
     }
 }
