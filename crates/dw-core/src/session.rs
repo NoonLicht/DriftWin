@@ -21,6 +21,9 @@ pub struct Entry {
     /// Командная строка процесса целиком (если удалось прочитать).
     #[serde(default)]
     pub cmdline: String,
+    /// AUMID упакованного приложения (UWP, Блокнот из Microsoft Store): запуск по нему, если пути недостаточно.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub aumid: String,
     pub cx: f64,
     pub cy: f64,
     pub w: f64,
@@ -174,6 +177,7 @@ mod tests {
                 app: "notepad.exe".into(),
                 title: "a".into(),
                 path: r"C:\w\notepad.exe".into(),
+                aumid: String::new(),
                 cmdline: String::new(),
                 cx: 1.0,
                 cy: 2.0,

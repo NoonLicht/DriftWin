@@ -4,7 +4,7 @@
 //! `driftwinctl msg action zoom-to-fit`, `driftwinctl msg subscribe`.
 
 use clap::{Parser, Subcommand};
-use dw_ipc::{Request, Response, Selector};
+use dw_ipc::{LayoutOp, Request, Response, Selector, ShotTarget};
 use serde_json::Value;
 
 #[derive(Parser)]
@@ -66,8 +66,8 @@ enum Msg {
     Suspend { window: String },
     /// Запустить приложение заглушки.
     Relaunch { window: String },
-    /// Раскладка клавиатуры (не поддерживается).
-    Layout,
+    /// Раскладки клавиатуры окна в фокусе: без аргумента — список; next, prev или номер — переключить.
+    Layout { op: Option<String> },
     /// Позиция курсора; с двумя числами — переставить курсор.
     Cursor {
         #[arg(requires = "y", allow_negative_numbers = true)]
@@ -86,8 +86,22 @@ enum Msg {
         #[arg(long)]
         set: bool,
     },
-    /// Снимок экрана под управлением в PNG.
-    Screenshot { path: String },
+    /// Снимок в PNG: по умолчанию мониторы под управлением.
+    Screenshot {
+        path: String,
+        /// Весь виртуальный рабочий стол.
+        #[arg(long, conflicts_with_all = ["output", "window", "region"])]
+        all: bool,
+        /// Один монитор: DISPLAY1, primary или номер.
+        #[arg(long, conflicts_with_all = ["window", "region"])]
+        output: Option<String>,
+        /// Одно окно: id или часть имени приложения.
+        #[arg(long, conflicts_with = "region")]
+        window: Option<String>,
+        /// Область экрана: X Y ширина высота.
+        #[arg(long, num_args = 4, allow_negative_numbers = true, value_names = ["X", "Y", "W", "H"])]
+        region: Option<Vec<i32>>,
+    },
     /// Состояние: камера, окна, мониторы.
     State,
     /// Поток изменений состояния (по строке JSON, не чаще 30 в секунду).
@@ -96,8 +110,8 @@ enum Msg {
     DebugCounters,
 }
 
-fn request(m: Msg) -> Request {
-    match m {
+fn request(m: Msg) -> Result<Request, String> {
+    Ok(match m {
         Msg::Camera { x, y, relative } => Request::Camera { x, y, relative },
         Msg::Zoom { level } => Request::Zoom { level },
         Msg::Focus { window } => Request::Focus {
@@ -135,17 +149,43 @@ fn request(m: Msg) -> Request {
         Msg::Relaunch { window } => Request::Relaunch {
             window: Selector::parse(&window),
         },
-        Msg::Layout => Request::Layout,
+        Msg::Layout { op } => Request::Layout {
+            op: LayoutOp::parse(op.as_deref())?,
+        },
         Msg::Cursor { x, y } => Request::Cursor { to: x.zip(y) },
         Msg::Action { name } => Request::Action {
             name: name.join(" "),
         },
         Msg::Bookmark { n, set } => Request::Bookmark { n, set },
-        Msg::Screenshot { path } => Request::Screenshot { path },
+        Msg::Screenshot {
+            path,
+            all,
+            output,
+            window,
+            region,
+        } => Request::Screenshot {
+            path,
+            target: if all {
+                ShotTarget::All
+            } else if let Some(o) = output {
+                ShotTarget::Output(o)
+            } else if let Some(w) = window {
+                ShotTarget::Window(Selector::parse(&w))
+            } else if let Some(r) = region {
+                ShotTarget::Region {
+                    x: r[0],
+                    y: r[1],
+                    w: r[2],
+                    h: r[3],
+                }
+            } else {
+                ShotTarget::Screen
+            },
+        },
         Msg::State => Request::State,
         Msg::Subscribe => Request::Subscribe,
         Msg::DebugCounters => Request::DebugCounters,
-    }
+    })
 }
 
 /// Человекочитаемый вывод состояния; остальное — компактный JSON.
@@ -160,6 +200,23 @@ fn pretty(v: &Value) -> String {
             })
             .unwrap_or_default()
     };
+    if let (Some(list), Some(cur)) = (v.get("layouts").and_then(Value::as_array), v.get("current"))
+    {
+        let mut s = String::new();
+        for (i, l) in list.iter().enumerate() {
+            let mark = if cur.as_u64() == Some(i as u64) {
+                "*"
+            } else {
+                " "
+            };
+            s += &format!(
+                "{mark} {i}  {}  {}\n",
+                l["id"].as_str().unwrap_or(""),
+                l["name"].as_str().unwrap_or("")
+            );
+        }
+        return s.trim_end().to_string();
+    }
     if let (Some(cam), Some(wins)) = (v.get("camera"), v.get("windows").and_then(Value::as_array)) {
         let mut s = format!(
             "камера ({}), масштаб {:.2}, окон {}\n",
@@ -201,7 +258,13 @@ fn pretty(v: &Value) -> String {
 fn main() {
     let cli = Cli::parse();
     let Top::Msg { cmd } = cli.cmd;
-    let req = request(cmd);
+    let req = match request(cmd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("driftwinctl: {e}");
+            std::process::exit(2);
+        }
+    };
     if req == Request::Subscribe {
         let r = dw_ipc::subscribe(|line| {
             println!("{line}");

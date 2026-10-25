@@ -94,8 +94,10 @@ pub enum Request {
     Relaunch {
         window: Selector,
     },
-    /// Раскладка клавиатуры (в DriftWin не поддерживается).
-    Layout,
+    /// Раскладки клавиатуры окна в фокусе: список, следующая/предыдущая или по номеру.
+    Layout {
+        op: LayoutOp,
+    },
     /// Позиция курсора на экране и в мире; с `x`,`y` — переставить курсор.
     Cursor {
         to: Option<(i32, i32)>,
@@ -109,14 +111,54 @@ pub enum Request {
         n: u8,
         set: bool,
     },
-    /// Снимок экрана под управлением в PNG.
+    /// Снимок в PNG: весь холст (мониторы под управлением), все мониторы, один монитор, окно или область.
     Screenshot {
         path: String,
+        target: ShotTarget,
     },
     State,
     /// Поток снимков состояния, не чаще 30 в секунду.
     Subscribe,
     DebugCounters,
+}
+
+/// Что делать с раскладками клавиатуры.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LayoutOp {
+    List,
+    Next,
+    Prev,
+    Set(usize),
+}
+
+impl LayoutOp {
+    /// Из аргумента командной строки: пусто/`list`, `next`, `prev` или номер.
+    pub fn parse(s: Option<&str>) -> Result<Self, String> {
+        match s.map(str::trim) {
+            None | Some("" | "list") => Ok(Self::List),
+            Some("next") => Ok(Self::Next),
+            Some("prev") => Ok(Self::Prev),
+            Some(n) => n
+                .parse()
+                .map(Self::Set)
+                .map_err(|_| format!("ожидалось list, next, prev или номер раскладки, а не «{n}»")),
+        }
+    }
+}
+
+/// Что снимать.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShotTarget {
+    /// Мониторы под управлением (общий холст).
+    Screen,
+    /// Весь виртуальный рабочий стол.
+    All,
+    /// Один монитор по имени (`DISPLAY1`), `primary` или номеру.
+    Output(String),
+    /// Одно окно (видно и за краем экрана, и под другими).
+    Window(Selector),
+    /// Область экрана в пикселях виртуального рабочего стола.
+    Region { x: i32, y: i32, w: i32, h: i32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,8 +356,8 @@ fn connection(mut f: File, tx: &Sender<Call>, bus: &Bus) {
             if tx.send(Call { req, reply: rtx }).is_err() {
                 Response::Err("демон завершается".into())
             } else {
-                rrx.recv_timeout(Duration::from_secs(5))
-                    .unwrap_or_else(|_| Response::Err("демон не ответил за 5 с".into()))
+                rrx.recv_timeout(Duration::from_secs(60))
+                    .unwrap_or_else(|_| Response::Err("демон не ответил за 60 с".into()))
             }
         }
     };
@@ -394,6 +436,15 @@ pub fn subscribe(mut on_line: impl FnMut(&str) -> bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_op_parses() {
+        assert_eq!(LayoutOp::parse(None), Ok(LayoutOp::List));
+        assert_eq!(LayoutOp::parse(Some("next")), Ok(LayoutOp::Next));
+        assert_eq!(LayoutOp::parse(Some("prev")), Ok(LayoutOp::Prev));
+        assert_eq!(LayoutOp::parse(Some("2")), Ok(LayoutOp::Set(2)));
+        assert!(LayoutOp::parse(Some("bogus")).is_err());
+    }
 
     #[test]
     fn selector_parses_number_or_app() {

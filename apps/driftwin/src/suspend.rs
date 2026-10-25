@@ -1,7 +1,7 @@
 //! Этап 7: заглушки (`suspend-window`, `suspend_on_close`), сессия (`session.json`), IPC и файл состояния.
 
 use dw_core::session::{self, Entry, Session};
-use dw_ipc::{Bus, Call, Request, Response, Selector};
+use dw_ipc::{Bus, Call, LayoutOp, Request, Response, Selector, ShotTarget};
 use serde_json::json;
 use std::collections::HashSet;
 
@@ -12,6 +12,28 @@ use super::*;
 pub(crate) struct Launch {
     pub path: String,
     pub cmdline: String,
+    /// AUMID упакованного приложения; пусто — обычная программа.
+    pub aumid: String,
+}
+
+impl Launch {
+    /// Упакованные приложения (UWP, Microsoft Store) нельзя запустить по пути к exe: запускаем по AUMID.
+    fn by_aumid(&self) -> bool {
+        !self.aumid.is_empty()
+            && (self.path.is_empty() || self.path.to_lowercase().contains("\\windowsapps\\"))
+    }
+
+    fn can_start(&self) -> bool {
+        self.by_aumid() || !self.path.is_empty()
+    }
+
+    fn start(&self) -> anyhow::Result<u32> {
+        if self.by_aumid() {
+            dw_win::launch_aumid(&self.aumid)
+        } else {
+            dw_win::launch(&self.path, &self.cmdline)
+        }
+    }
 }
 
 /// Заглушка на холсте.
@@ -25,6 +47,18 @@ pub(crate) struct StubInfo {
     pub launch: Launch,
     /// Запущено: когда и какой pid.
     pub launching: Option<(Instant, u32)>,
+}
+
+impl StubInfo {
+    fn new(app: &str, title: &str, launch: Launch) -> Self {
+        Self {
+            app: app.to_string(),
+            name: stub_name(app, title),
+            title: title.to_string(),
+            launch,
+            launching: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -62,6 +96,8 @@ pub(crate) struct Ext {
     pub state_next: Instant,
     pub state_txt: String,
     pub counters: Counters,
+    /// Когда последний раз левая кнопка была нажата на панели задач или её миниатюрах.
+    pub taskbar_click: Option<Instant>,
 }
 
 impl Ext {
@@ -85,12 +121,24 @@ impl Ext {
             state_next: Instant::now(),
             state_txt: String::new(),
             counters: Counters::default(),
+            taskbar_click: None,
         }
     }
 }
 
-/// Приложения, чьё окно нельзя перезапустить по пути процесса (окном владеет другой процесс).
-const NO_STUB_HOSTS: &[&str] = &["applicationframehost.exe"];
+/// Окнами этих процессов владеет оболочка, а не само приложение: имя заглушки берём из заголовка окна.
+const FRAME_HOSTS: &[&str] = &["applicationframehost.exe"];
+/// Классы окон панели задач и её миниатюр: клик по ним — закрытие пользователем, а не приложением.
+const TASKBAR_CLASSES: &[&str] = &[
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "TaskListThumbnailWnd",
+    "TaskListOverlayWnd",
+    "XamlExplorerHostIslandWindow",
+    "TopLevelWindowForOverflowXamlIsland",
+];
+/// Сколько после клика по панели задач закрытие окна считается сделанным оттуда.
+const TASKBAR_CLOSE_WINDOW: Duration = Duration::from_millis(2500);
 
 /// Сколько ждём, что приложение закроется само после `WM_CLOSE`, прежде чем отказаться от заглушки.
 const SUSPEND_WAIT: Duration = Duration::from_secs(8);
@@ -110,6 +158,15 @@ fn display_name(exe: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Надпись на заглушке: для окон-оболочек (UWP) — заголовок окна, иначе имя exe.
+fn stub_name(app: &str, title: &str) -> String {
+    if FRAME_HOSTS.contains(&app.to_lowercase().as_str()) && !title.trim().is_empty() {
+        title.trim().to_string()
+    } else {
+        display_name(app)
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -121,12 +178,27 @@ impl App {
 
     /// Запомнить, как запускать приложение окна (после его смерти спросить уже не у кого).
     pub(crate) fn capture_launch(&mut self, m: &Managed) {
-        if m.class == dw_win::STUB_CLASS || NO_STUB_HOSTS.contains(&m.exe.to_lowercase().as_str()) {
+        if m.class == dw_win::STUB_CLASS {
             return;
         }
-        if let Some(path) = dw_win::image_path(m.pid) {
-            let cmdline = dw_win::command_line(m.pid).unwrap_or_default();
-            self.ext.launch.insert(m.id, Launch { path, cmdline });
+        let aumid = dw_win::window_aumid(m.id).unwrap_or_default();
+        // окно-оболочка (UWP): процесс владельца — не приложение, путь и командная строка бесполезны
+        let framed = FRAME_HOSTS.contains(&m.exe.to_lowercase().as_str());
+        let (path, cmdline) = if framed {
+            (String::new(), String::new())
+        } else {
+            (
+                dw_win::image_path(m.pid).unwrap_or_default(),
+                dw_win::command_line(m.pid).unwrap_or_default(),
+            )
+        };
+        let launch = Launch {
+            path,
+            cmdline,
+            aumid,
+        };
+        if launch.can_start() {
+            self.ext.launch.insert(m.id, launch);
         }
     }
 
@@ -233,7 +305,12 @@ impl App {
         let (Some(m), Some(rect)) = (self.managed.get(&id).cloned(), self.canvas.rect(id)) else {
             return;
         };
-        let by_us = self.ext.closing.remove(&id).is_some();
+        // клик по панели задач (кнопка «Закрыть окно» на миниатюре) — пользователь закрыл окно сам
+        let from_taskbar = self
+            .ext
+            .taskbar_click
+            .is_some_and(|t| t.elapsed() < TASKBAR_CLOSE_WINDOW);
+        let by_us = self.ext.closing.remove(&id).is_some() || from_taskbar;
         let asked = self.ext.suspending.iter().any(|s| s.0 == id);
         self.ext.suspending.retain(|s| s.0 != id);
         let want = asked
@@ -246,13 +323,7 @@ impl App {
             return;
         }
         let Some(launch) = launch else { return };
-        let info = StubInfo {
-            app: m.exe.clone(),
-            name: display_name(&m.exe),
-            title: m.title.clone(),
-            launch,
-            launching: None,
-        };
+        let info = StubInfo::new(&m.exe, &m.title, launch);
         if self.make_stub(info, rect).is_some() {
             tracing::info!("«{}» закрыто — на его месте заглушка", m.title);
         }
@@ -264,7 +335,7 @@ impl App {
         if info.launching.is_some() {
             return Ok(());
         }
-        match dw_win::launch(&info.launch.path, &info.launch.cmdline) {
+        match info.launch.start() {
             Ok(pid) => {
                 info.launching = Some((Instant::now(), pid));
                 dw_render::set_stub_launching(id.0, true);
@@ -273,7 +344,7 @@ impl App {
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("не удалось запустить «{}»: {e}", info.launch.path);
+                tracing::warn!("не удалось запустить «{}»: {e}", info.name);
                 Err(format!("не удалось запустить: {e}"))
             }
         }
@@ -288,13 +359,24 @@ impl App {
 
     /// Новое окно приложения, которое мы только что запустили из заглушки, занимает её место.
     /// Возвращает мировой прямоугольник заглушки.
+    ///
+    /// Окно признаётся «своим», если (по убыванию надёжности): тот же AUMID; его процесс — тот, что мы запустили,
+    /// или его потомок (программа-пускатель вроде `code.exe` запускает настоящий процесс и выходит); либо,
+    /// как запасной вариант, то же имя exe в первые секунды после запуска.
     pub(crate) fn claim_stub(&mut self, m: &Managed) -> Option<Rect> {
+        if !self.ext.stubs.values().any(|s| s.launching.is_some()) {
+            return None;
+        }
         let exe = m.exe.to_lowercase();
+        let aumid = dw_win::window_aumid(m.id).unwrap_or_default();
+        let chain = dw_win::ancestors(m.pid);
         let id = self.ext.stubs.iter().find_map(|(id, s)| {
             let (since, pid) = s.launching?;
-            let by_pid = pid == m.pid && since.elapsed() < LAUNCH_PID_WINDOW;
-            let by_name = s.app.to_lowercase() == exe && since.elapsed() < LAUNCH_NAME_WINDOW;
-            (by_pid || by_name).then_some(*id)
+            let age = since.elapsed();
+            let by_aumid = !aumid.is_empty() && s.launch.aumid == aumid && age < LAUNCH_PID_WINDOW;
+            let by_pid = age < LAUNCH_PID_WINDOW && (pid == m.pid || chain.contains(&pid));
+            let by_name = s.app.to_lowercase() == exe && age < LAUNCH_NAME_WINDOW;
+            (by_aumid || by_pid || by_name).then_some(*id)
         })?;
         let rect = self.canvas.rect(id)?;
         self.drop_stub(id);
@@ -305,6 +387,12 @@ impl App {
     /// Периодически: просроченные закрытия и запуски.
     pub(crate) fn stub_tick(&mut self) {
         let now = Instant::now();
+        // клик по панели задач запоминаем, чтобы отличить закрытие оттуда от закрытия самим приложением
+        if dw_win::left_button_down()
+            && TASKBAR_CLASSES.contains(&dw_win::class_at_cursor().as_str())
+        {
+            self.ext.taskbar_click = Some(now);
+        }
         self.ext.suspending.retain(|(id, t)| {
             let keep = now.duration_since(*t) < SUSPEND_WAIT;
             if !keep {
@@ -385,6 +473,7 @@ impl App {
                 title,
                 path: launch.path,
                 cmdline: launch.cmdline,
+                aumid: launch.aumid,
                 cx: r.center.x,
                 cy: r.center.y,
                 w: r.w,
@@ -527,19 +616,15 @@ impl App {
             rest.push(e);
         }
         for e in rest {
-            if e.path.is_empty() || !(e.suspended || self.cfg.session.restore_windows) {
+            let launch = Launch {
+                path: e.path.clone(),
+                cmdline: e.cmdline.clone(),
+                aumid: e.aumid.clone(),
+            };
+            if !launch.can_start() || !(e.suspended || self.cfg.session.restore_windows) {
                 continue;
             }
-            let info = StubInfo {
-                app: e.app.clone(),
-                name: display_name(&e.app),
-                title: e.title.clone(),
-                launch: Launch {
-                    path: e.path.clone(),
-                    cmdline: e.cmdline.clone(),
-                },
-                launching: None,
-            };
+            let info = StubInfo::new(&e.app, &e.title, launch);
             self.make_stub(
                 info,
                 Rect {
@@ -613,6 +698,81 @@ impl App {
             .ok_or_else(|| format!("окно {sel:?} не найдено"))
     }
 
+    fn find_output(&self, name: &str) -> Result<dw_win::MonitorInfo, String> {
+        let n = name.trim().to_lowercase();
+        self.geo
+            .all
+            .iter()
+            .find(|m| {
+                m.name.to_lowercase() == n
+                    || n == "primary" && m.primary
+                    || n.parse::<u32>()
+                        .is_ok_and(|k| m.name.to_lowercase() == format!("display{k}"))
+            })
+            .cloned()
+            .ok_or_else(|| format!("монитор «{name}» не найден"))
+    }
+
+    /// Снимок: пиксели RGBA и размер.
+    fn take_screenshot(&self, target: &ShotTarget) -> Result<(Vec<u8>, i32, i32), String> {
+        let rect = |(x, y, w, h): (i32, i32, i32, i32)| {
+            dw_win::capture_rect(x, y, w, h)
+                .map(|px| (px, w, h))
+                .ok_or_else(|| "снимок экрана не получился".to_string())
+        };
+        match target {
+            ShotTarget::Screen => rect(self.geo.bounds),
+            ShotTarget::All => rect(dw_win::virtual_screen()),
+            ShotTarget::Output(n) => rect(self.find_output(n)?.rect),
+            ShotTarget::Region { x, y, w, h } => rect((*x, *y, *w, *h)),
+            ShotTarget::Window(sel) => {
+                let id = self.find_window(sel)?;
+                if let Some(shot) = dw_win::capture_window(id) {
+                    return Ok(shot);
+                }
+                // PrintWindow отказал: берём то, что видно на экране
+                let v = self
+                    .managed
+                    .get(&id)
+                    .ok_or("окно не под управлением")?
+                    .visible;
+                rect((v.x, v.y, v.w, v.h))
+            }
+        }
+    }
+
+    /// Снять экран сейчас, а PNG закодировать и ответить в отдельном потоке (большие снимки кодируются секунды).
+    fn screenshot_async(
+        &self,
+        path: &str,
+        target: &ShotTarget,
+        reply: crossbeam_channel::Sender<Response>,
+    ) {
+        if self.ext.paused.load(SeqCst) {
+            let _ = reply.send(Response::Err("DriftWin на паузе".into()));
+            return;
+        }
+        if !path.to_lowercase().ends_with(".png") {
+            let _ = reply.send(Response::Err("путь должен оканчиваться на .png".into()));
+            return;
+        }
+        let (px, w, h) = match self.take_screenshot(target) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = reply.send(Response::Err(e));
+                return;
+            }
+        };
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            let resp = match dw_render::save_png(Path::new(&path), w as u32, h as u32, px) {
+                Ok(()) => Response::Ok(json!({"path": path, "size": [w, h]})),
+                Err(e) => Response::Err(e),
+            };
+            let _ = reply.send(resp);
+        });
+    }
+
     fn bookmark_at_camera(&self) -> Option<u8> {
         let c = self.canvas.viewport.center;
         self.bookmarks
@@ -659,15 +819,21 @@ impl App {
             .collect();
         let (cx, cy) = dw_win::cursor_pos();
         let active_bm = self.bookmark_at_camera();
+        // холст общий для всех выбранных мониторов, поэтому у каждого монитора «камера» — точка мира в его центре
         let outputs: Vec<_> = self
             .geo
             .sel
             .iter()
             .map(|mo| {
                 let r = mo.rect;
+                let at = self
+                    .canvas
+                    .screen_point_to_world(r.0 + r.2 / 2, r.1 + r.3 / 2);
                 json!({
                     "name": mo.name,
-                    "camera": [c.x, c.y],
+                    "camera": [at.x, at.y],
+                    "shared_camera": [c.x, c.y],
+                    "position": [r.0, r.1],
                     "zoom": self.zoom,
                     "size": [r.2, r.3],
                     "active": cx >= r.0 && cx < r.0 + r.2 && cy >= r.1 && cy < r.1 + r.3,
@@ -678,7 +844,9 @@ impl App {
         json!({
             "camera": [c.x, c.y],
             "zoom": self.zoom,
-            "layout": "",
+            "layout": dw_win::current_layout()
+                .and_then(|i| dw_win::keyboard_layouts().into_iter().nth(i))
+                .map_or_else(String::new, |l| l.name),
             "windows": windows,
             "fullscreen": self.fullscreen.map(|f| f.0.0),
             "pinned": pinned,
@@ -730,6 +898,10 @@ impl App {
         };
         while let Ok(call) = rx.try_recv() {
             self.ext.counters.ipc_calls += 1;
+            if let Request::Screenshot { path, target } = call.req {
+                self.screenshot_async(&path, &target, call.reply);
+                continue;
+            }
             let resp = match self.ipc_call(call.req) {
                 Ok(v) => Response::Ok(v),
                 Err(e) => Response::Err(e),
@@ -863,7 +1035,30 @@ impl App {
                 self.launch_stub(id)?;
                 done(())
             }
-            Request::Layout => Err("раскладка клавиатуры в DriftWin не поддерживается".into()),
+            Request::Layout { op } => {
+                let list = dw_win::keyboard_layouts();
+                let mut cur = dw_win::current_layout();
+                let n = list.len();
+                let step = |from: Option<usize>, back: bool| match (from, back) {
+                    (Some(i), false) => (i + 1) % n,
+                    (Some(i), true) => (i + n - 1) % n,
+                    (None, _) => 0,
+                };
+                let to = match op {
+                    LayoutOp::List => None,
+                    LayoutOp::Next => Some(step(cur, false)),
+                    LayoutOp::Prev => Some(step(cur, true)),
+                    LayoutOp::Set(i) => Some(i),
+                };
+                if let Some(i) = to {
+                    if n == 0 {
+                        return Err("раскладок не найдено".into());
+                    }
+                    dw_win::set_layout(i).map_err(|e| e.to_string())?;
+                    cur = Some(i);
+                }
+                Ok(json!({"current": cur, "layouts": list}))
+            }
             Request::Cursor { to } => {
                 if let Some((x, y)) = to {
                     unsafe {
@@ -889,16 +1084,8 @@ impl App {
                 }
                 done(())
             }
-            Request::Screenshot { path } => {
-                if !path.to_lowercase().ends_with(".png") {
-                    return Err("путь должен оканчиваться на .png".into());
-                }
-                let b = self.geo.bounds;
-                let px =
-                    dw_win::capture_rect(b.0, b.1, b.2, b.3).ok_or("снимок экрана не получился")?;
-                dw_render::save_png(Path::new(&path), b.2 as u32, b.3 as u32, px)?;
-                Ok(json!({"path": path, "size": [b.2, b.3]}))
-            }
+            // снимок обрабатывает `serve_ipc`: кодирование PNG не должно стопорить главный цикл
+            Request::Screenshot { .. } => Err("внутренняя ошибка: снимок обработан не там".into()),
             Request::Subscribe => Err("Subscribe — потоковый запрос".into()),
         }
     }
@@ -926,5 +1113,32 @@ mod tests {
         assert_eq!(display_name("Code.EXE"), "Code");
         assert_eq!(display_name("яндекс.exe"), "Яндекс");
         assert_eq!(display_name(""), "");
+    }
+
+    #[test]
+    fn frame_host_stub_is_named_by_title() {
+        assert_eq!(
+            stub_name("ApplicationFrameHost.exe", " Калькулятор "),
+            "Калькулятор"
+        );
+        assert_eq!(
+            stub_name("ApplicationFrameHost.exe", ""),
+            "ApplicationFrameHost"
+        );
+        assert_eq!(stub_name("notepad.exe", "Безымянный"), "Notepad");
+    }
+
+    #[test]
+    fn packaged_apps_launch_by_aumid() {
+        let l = |path: &str, aumid: &str| Launch {
+            path: path.into(),
+            cmdline: String::new(),
+            aumid: aumid.into(),
+        };
+        assert!(l("", "Pkg!App").by_aumid());
+        assert!(l(r"C:\Program Files\WindowsApps\X\x.exe", "Pkg!App").by_aumid());
+        assert!(!l(r"C:\tools\a.exe", "Pkg!App").by_aumid());
+        assert!(!l(r"C:\tools\a.exe", "").by_aumid());
+        assert!(!l("", "").can_start());
     }
 }

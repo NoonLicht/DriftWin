@@ -12,9 +12,9 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS,
-    EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDIBits, GetMonitorInfoW, HDC, HMONITOR,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, ReleaseDC, SRCCOPY,
-    SelectObject, SetWindowRgn,
+    EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDIBits, GetMonitorInfoW, HBITMAP, HDC,
+    HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, ReleaseDC,
+    SRCCOPY, SelectObject, SetWindowRgn,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::*;
@@ -903,9 +903,47 @@ pub fn set_opacity(
     }
 }
 
+/// Пиксели выбранного в `mdc` битмапа как RGBA (`w*h*4`).
+unsafe fn read_dib(mdc: HDC, bmp: HBITMAP, w: i32, h: i32) -> Option<Vec<u8>> {
+    let mut bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    let lines = unsafe {
+        GetDIBits(
+            mdc,
+            bmp,
+            0,
+            h as u32,
+            Some(px.as_mut_ptr().cast()),
+            &mut bi,
+            DIB_RGB_COLORS,
+        )
+    };
+    if lines == 0 {
+        return None;
+    }
+    for c in px.as_chunks_mut::<4>().0 {
+        c.swap(0, 2);
+        c[3] = 255;
+    }
+    Some(px)
+}
+
+const MAX_SHOT_PIXELS: i64 = 64_000_000;
+
 /// Снимок прямоугольника экрана: RGBA-пиксели `w*h*4`.
 pub fn capture_rect(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
-    if w <= 0 || h <= 0 || i64::from(w) * i64::from(h) > 64_000_000 {
+    if w <= 0 || h <= 0 || i64::from(w) * i64::from(h) > MAX_SHOT_PIXELS {
         return None;
     }
     unsafe {
@@ -914,39 +952,223 @@ pub fn capture_rect(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
         let bmp = CreateCompatibleBitmap(sdc, w, h);
         let old = SelectObject(mdc, bmp.into());
         let blt = BitBlt(mdc, 0, 0, w, h, Some(sdc), x, y, SRCCOPY | CAPTUREBLT).is_ok();
-        let mut bi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut px = vec![0u8; (w * h * 4) as usize];
-        let lines = GetDIBits(
-            mdc,
-            bmp,
-            0,
-            h as u32,
-            Some(px.as_mut_ptr().cast()),
-            &mut bi,
-            DIB_RGB_COLORS,
-        );
+        let px = if blt { read_dib(mdc, bmp, w, h) } else { None };
         SelectObject(mdc, old);
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mdc);
         ReleaseDC(None, sdc);
-        if !blt || lines == 0 {
+        px
+    }
+}
+
+/// Снимок одного окна (видимая рамка) через `PrintWindow`: работает и для окон за краем экрана и под другими.
+/// Возвращает пиксели RGBA и размер.
+pub fn capture_window(id: WindowId) -> Option<(Vec<u8>, i32, i32)> {
+    let h = hwnd_of(id);
+    let (border, vis) = measure(h)?;
+    let wr = window_rect(h);
+    let (fw, fh) = (wr.right - wr.left, wr.bottom - wr.top);
+    if fw <= 0 || fh <= 0 || i64::from(fw) * i64::from(fh) > MAX_SHOT_PIXELS {
+        return None;
+    }
+    unsafe {
+        let sdc = GetDC(None);
+        let mdc = CreateCompatibleDC(Some(sdc));
+        let bmp = CreateCompatibleBitmap(sdc, fw, fh);
+        let old = SelectObject(mdc, bmp.into());
+        // PW_RENDERFULLCONTENT = 2: окна на DirectComposition и UWP
+        let ok = windows::Win32::Storage::Xps::PrintWindow(
+            h,
+            mdc,
+            windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(2),
+        )
+        .as_bool();
+        let px = if ok { read_dib(mdc, bmp, fw, fh) } else { None };
+        SelectObject(mdc, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mdc);
+        ReleaseDC(None, sdc);
+        let px = px?;
+        // обрезать невидимую рамку
+        let (x0, y0) = (border.l.max(0), border.t.max(0));
+        let (w, hh) = (vis.w.min(fw - x0), vis.h.min(fh - y0));
+        if w <= 0 || hh <= 0 {
             return None;
         }
-        for c in px.as_chunks_mut::<4>().0 {
-            c.swap(0, 2);
-            c[3] = 255;
+        let mut out = Vec::with_capacity((w * hh * 4) as usize);
+        for row in 0..hh {
+            let start = (((y0 + row) * fw + x0) * 4) as usize;
+            out.extend_from_slice(&px[start..start + (w * 4) as usize]);
         }
-        Some(px)
+        Some((out, w, hh))
     }
+}
+
+// ---------- запуск приложений без пути (UWP) и родство процессов ----------
+
+/// AUMID окна (`System.AppUserModel.ID`): есть у UWP/упакованных приложений и у окон с явным идентификатором.
+pub fn window_aumid(id: WindowId) -> Option<String> {
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        IPropertyStore, SHGetPropertyStoreForWindow,
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd_of(id)).ok()?;
+        let v = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
+        let p = PropVariantToStringAlloc(&v).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0.cast()));
+        s.filter(|s| !s.is_empty())
+    }
+}
+
+/// Запустить приложение по AUMID (`IApplicationActivationManager`). Возвращает pid процесса приложения.
+pub fn launch_aumid(aumid: &str) -> Result<u32> {
+    use windows::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    };
+    use windows::Win32::UI::Shell::{
+        AO_NONE, ApplicationActivationManager, IApplicationActivationManager,
+    };
+    use windows::core::HSTRING;
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let mgr: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+        Ok(mgr.ActivateApplication(&HSTRING::from(aumid), &HSTRING::new(), AO_NONE)?)
+    }
+}
+
+/// Предки процесса (родитель, его родитель, …) — до 8 звеньев. Умерший родитель остаётся в цепочке,
+/// пока жив потомок.
+pub fn ancestors(pid: u32) -> Vec<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return vec![];
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                parents.insert(e.th32ProcessID, e.th32ParentProcessID);
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    let mut out = Vec::new();
+    let mut cur = pid;
+    while out.len() < 8 {
+        match parents.get(&cur) {
+            Some(&p) if p != 0 && !out.contains(&p) && p != pid => {
+                out.push(p);
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+// ---------- панель задач ----------
+
+/// Класс окна верхнего уровня под курсором.
+pub fn class_at_cursor() -> String {
+    let (x, y) = cursor_pos();
+    window_at(x, y).map_or_else(String::new, |id| class_of(hwnd_of(id)))
+}
+
+/// Нажата ли левая кнопка мыши.
+pub fn left_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) as u16 & 0x8000 != 0 }
+}
+
+// ---------- раскладки клавиатуры ----------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KbLayout {
+    /// Идентификатор раскладки (HKL) в шестнадцатеричном виде.
+    pub id: String,
+    /// Название языка: «русский (Россия)».
+    pub name: String,
+}
+
+fn layout_name(hkl: isize) -> String {
+    use windows::Win32::Globalization::GetLocaleInfoW;
+    let langid = (hkl & 0xFFFF) as u32;
+    let mut buf = [0u16; 128];
+    // LOCALE_SLANGUAGE = 2: название языка на языке интерфейса
+    let n = unsafe { GetLocaleInfoW(langid, 2, Some(&mut buf)) };
+    if n > 1 {
+        String::from_utf16_lossy(&buf[..(n - 1) as usize])
+    } else {
+        format!("{langid:04x}")
+    }
+}
+
+fn layout_handles() -> Vec<windows::Win32::UI::Input::KeyboardAndMouse::HKL> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutList;
+    let mut v = vec![Default::default(); 64];
+    let n = unsafe { GetKeyboardLayoutList(Some(&mut v)) }.max(0) as usize;
+    v.truncate(n);
+    v
+}
+
+/// Установленные раскладки.
+pub fn keyboard_layouts() -> Vec<KbLayout> {
+    layout_handles()
+        .iter()
+        .map(|h| {
+            let raw = h.0 as isize;
+            KbLayout {
+                id: format!("{:08x}", raw as usize as u32),
+                name: layout_name(raw),
+            }
+        })
+        .collect()
+}
+
+fn foreground_hwnd() -> Option<HWND> {
+    let h = unsafe { GetForegroundWindow() };
+    (!h.0.is_null()).then_some(h)
+}
+
+/// Индекс раскладки окна, которое сейчас в фокусе (раскладка у каждого потока своя).
+pub fn current_layout() -> Option<usize> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    let fg = foreground_hwnd()?;
+    let tid = unsafe { GetWindowThreadProcessId(fg, None) };
+    let cur = unsafe { GetKeyboardLayout(tid) };
+    layout_handles().iter().position(|h| h.0 == cur.0)
+}
+
+/// Переключить раскладку окна в фокусе на раскладку с номером `index`.
+pub fn set_layout(index: usize) -> Result<()> {
+    let hs = layout_handles();
+    let hkl = *hs
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("раскладки {index} нет (всего {})", hs.len()))?;
+    let fg = foreground_hwnd().ok_or_else(|| anyhow::anyhow!("нет окна в фокусе"))?;
+    unsafe {
+        PostMessageW(
+            Some(fg),
+            WM_INPUTLANGCHANGEREQUEST,
+            Default::default(),
+            LPARAM(hkl.0 as isize),
+        )?;
+    }
+    Ok(())
 }
