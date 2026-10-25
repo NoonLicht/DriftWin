@@ -1172,3 +1172,167 @@ pub fn set_layout(index: usize) -> Result<()> {
     }
     Ok(())
 }
+
+// ---------- оформление DWM (Windows 11) ----------
+
+/// Что было у окна до нашего вмешательства: для возврата.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecoSaved {
+    corner: Option<i32>,
+    border: Option<u32>,
+    backdrop: Option<i32>,
+}
+
+const DWMWA_CORNER: i32 = 33;
+const DWMWA_BORDER: i32 = 34;
+const DWMWA_BACKDROP: i32 = 38;
+/// `DWMWA_COLOR_NONE`: рамка не рисуется.
+pub const BORDER_NONE: u32 = 0xFFFF_FFFE;
+
+/// Цвет рамки в формате COLORREF (`0x00BBGGRR`).
+pub fn colorref(rgb: [u8; 3]) -> u32 {
+    u32::from(rgb[0]) | u32::from(rgb[1]) << 8 | u32::from(rgb[2]) << 16
+}
+
+fn dwm_get(h: HWND, attr: i32) -> Option<u32> {
+    let mut v = 0u32;
+    unsafe {
+        windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            h,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(attr),
+            &mut v as *mut _ as *mut _,
+            4,
+        )
+        .ok()?;
+    }
+    Some(v)
+}
+
+fn dwm_set(h: HWND, attr: i32, v: u32) -> bool {
+    unsafe {
+        windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            h,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(attr),
+            &v as *const _ as *const _,
+            4,
+        )
+        .is_ok()
+    }
+}
+
+/// Привести оформление окна к желаемому: `Some` — установить (запомнив прежнее значение), `None` — вернуть прежнее,
+/// если мы его меняли. Системы старше Windows 11 атрибуты отвергают — тогда ничего не меняется.
+pub fn set_deco(
+    id: WindowId,
+    corner: Option<i32>,
+    border: Option<u32>,
+    backdrop: Option<i32>,
+    saved: &mut DecoSaved,
+) {
+    let h = hwnd_of(id);
+    // цвет рамки прочитать нельзя: возвращаем системное значение (`DWMWA_COLOR_DEFAULT`)
+    let one = |attr: i32, want: Option<u32>, slot: &mut Option<u32>| match want {
+        Some(v) => {
+            if slot.is_none() {
+                *slot = dwm_get(h, attr).or((attr == DWMWA_BORDER).then_some(0xFFFF_FFFF));
+            }
+            let _ = dwm_set(h, attr, v);
+        }
+        None => {
+            if let Some(old) = slot.take() {
+                let _ = dwm_set(h, attr, old);
+            }
+        }
+    };
+    let mut c = saved.corner.map(|v| v as u32);
+    one(DWMWA_CORNER, corner.map(|v| v as u32), &mut c);
+    saved.corner = c.map(|v| v as i32);
+    one(DWMWA_BORDER, border, &mut saved.border);
+    let mut b = saved.backdrop.map(|v| v as u32);
+    one(DWMWA_BACKDROP, backdrop.map(|v| v as u32), &mut b);
+    saved.backdrop = b.map(|v| v as i32);
+}
+
+// ---------- автозапуск ----------
+
+const RUN_KEY: windows::core::PCWSTR =
+    windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+
+/// Включить автозапуск при входе в систему (`HKCU\...\Run`): `command` — командная строка целиком.
+pub fn autostart_enable(name: &str, command: &str) -> Result<()> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
+    let n: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let v: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
+    let err = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            windows::core::PCWSTR(n.as_ptr()),
+            REG_SZ.0,
+            Some(v.as_ptr().cast()),
+            (v.len() * 2) as u32,
+        )
+    };
+    err.ok().map_err(Into::into)
+}
+
+/// Выключить автозапуск; отсутствие записи — не ошибка.
+pub fn autostart_disable(name: &str) -> Result<()> {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW};
+    let n: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let err = unsafe {
+        RegDeleteKeyValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            windows::core::PCWSTR(n.as_ptr()),
+        )
+    };
+    if err == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    err.ok().map_err(Into::into)
+}
+
+/// Командная строка автозапуска, если включён.
+pub fn autostart_status(name: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    let n: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    let err = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            windows::core::PCWSTR(n.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if err.is_err() {
+        return None;
+    }
+    let len = (size as usize / 2).saturating_sub(1).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+#[cfg(test)]
+mod autostart_tests {
+    use super::*;
+
+    #[test]
+    fn autostart_roundtrip_under_test_name() {
+        let name = "DriftWinUnitTest";
+        autostart_disable(name).unwrap();
+        assert_eq!(autostart_status(name), None);
+        autostart_enable(name, r#""C:\Program Files\DriftWin\driftwin.exe" --all"#).unwrap();
+        assert_eq!(
+            autostart_status(name).as_deref(),
+            Some(r#""C:\Program Files\DriftWin\driftwin.exe" --all"#)
+        );
+        autostart_disable(name).unwrap();
+        assert_eq!(autostart_status(name), None);
+    }
+}

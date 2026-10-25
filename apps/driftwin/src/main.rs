@@ -27,6 +27,8 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod deco;
+mod onboarding;
 mod suspend;
 
 /// Через сколько без нажатий переключатель MRU фиксирует выбор.
@@ -128,6 +130,14 @@ struct Opts {
     /// Диагностика: сразу после старта отдалить вид до этого масштаба.
     start_zoom: Option<f64>,
     list_monitors: bool,
+    /// `--autostart on|off|status`.
+    autostart: Option<String>,
+    /// Остальные аргументы командной строки: попадают в команду автозапуска.
+    passthrough: Vec<String>,
+    /// Каталог состояния задан явно (разработка и тесты): памятка первого запуска не показывается.
+    state_dir_explicit: bool,
+    /// Напечатать памятку и выйти.
+    onboarding: bool,
 }
 
 fn exe_list(v: Option<String>) -> Vec<String> {
@@ -178,10 +188,20 @@ fn parse_args() -> Result<Opts> {
         no_auto_navigate: false,
         start_zoom: None,
         list_monitors: false,
+        autostart: None,
+        passthrough: vec![],
+        state_dir_explicit: false,
+        onboarding: false,
     };
-    let mut a = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut a = argv.clone().into_iter();
     while let Some(x) = a.next() {
         match x.as_str() {
+            "--autostart" => match a.next().as_deref() {
+                Some(v @ ("on" | "off" | "status")) => o.autostart = Some(v.to_string()),
+                _ => bail!("--autostart принимает on, off или status"),
+            },
+            "--onboarding" => o.onboarding = true,
             "--only" => {
                 let v = exe_list(a.next());
                 if v.is_empty() {
@@ -194,7 +214,10 @@ fn parse_args() -> Result<Opts> {
             "--widget" => o.widgets = exe_list(a.next()),
             "--no-auto-navigate" => o.no_auto_navigate = true,
             "--start-zoom" => o.start_zoom = a.next().and_then(|v| v.parse().ok()),
-            "--state-dir" => o.state_dir = a.next().map(PathBuf::from).unwrap_or(o.state_dir),
+            "--state-dir" => {
+                o.state_dir_explicit = true;
+                o.state_dir = a.next().map(PathBuf::from).unwrap_or(o.state_dir)
+            }
             "--config" => match a.next() {
                 Some(p) => o.config_path = PathBuf::from(p),
                 None => bail!("--config требует путь"),
@@ -204,7 +227,66 @@ fn parse_args() -> Result<Opts> {
             other => bail!("неизвестный аргумент {other}"),
         }
     }
+    // для автозапуска: все аргументы, кроме самого `--autostart X`
+    let mut it = argv.into_iter();
+    while let Some(x) = it.next() {
+        if x == "--autostart" {
+            it.next();
+        } else if x != "--onboarding" {
+            o.passthrough.push(x);
+        }
+    }
     Ok(o)
+}
+
+/// Команда для `HKCU\...\Run`: путь к exe в кавычках и аргументы запуска.
+fn autostart_command(exe: &Path, args: &[String]) -> String {
+    let mut s = format!("\"{}\"", exe.display());
+    for a in args {
+        s.push(' ');
+        if a.contains(' ') {
+            s += &format!("\"{a}\"");
+        } else {
+            s += a;
+        }
+    }
+    s
+}
+
+/// `--autostart`: включить, выключить или показать. Возвращает код выхода.
+fn run_autostart(mode: &str, args: &[String]) -> i32 {
+    const NAME: &str = "DriftWin";
+    match mode {
+        "status" => match dw_win::autostart_status(NAME) {
+            Some(c) => println!("автозапуск включён: {c}"),
+            None => println!("автозапуск выключен"),
+        },
+        "off" => match dw_win::autostart_disable(NAME) {
+            Ok(()) => println!("автозапуск выключен"),
+            Err(e) => {
+                eprintln!("driftwin: не удалось выключить автозапуск: {e}");
+                return 1;
+            }
+        },
+        _ => {
+            let Ok(exe) = std::env::current_exe() else {
+                eprintln!("driftwin: не удалось определить путь к exe");
+                return 1;
+            };
+            let cmd = autostart_command(&exe, args);
+            match dw_win::autostart_enable(NAME, &cmd) {
+                Ok(()) => println!(
+                    "автозапуск включён: {cmd}
+Демон стартует в безопасном режиме: нужны [windows] only в конфиге или --all в команде."
+                ),
+                Err(e) => {
+                    eprintln!("driftwin: не удалось включить автозапуск: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+    0
 }
 
 /// Прочитать и проверить конфиг. Нет файла — стандартные настройки.
@@ -1779,6 +1861,7 @@ impl App {
             }
         }
         self.stub_tick();
+        self.deco_tick();
         self.session_poll();
         self.publish_state();
         if let Some(t) = self.last_cycle
@@ -1805,6 +1888,13 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if opts.onboarding {
+        println!("{}", onboarding::TEXT);
+        return Ok(());
+    }
+    if let Some(mode) = &opts.autostart {
+        std::process::exit(run_autostart(mode, &opts.passthrough));
+    }
     if opts.list_monitors {
         dw_win::init_dpi();
         for m in dw_win::monitors() {
@@ -1868,6 +1958,9 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
     dw_win::init_dpi();
+    if !opts.state_dir_explicit {
+        onboarding::first_run(&opts.state_dir);
+    }
 
     unsafe {
         // экземпляр один на каталог состояния: для обычного запуска это один на пользователя
@@ -2102,6 +2195,23 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autostart_command_quotes_path_and_spaced_args() {
+        let c = autostart_command(
+            Path::new(r"C:\Program Files\DriftWin\driftwin.exe"),
+            &[
+                "--only".into(),
+                "a.exe,b.exe".into(),
+                "--config".into(),
+                r"C:\My Dir\c.toml".into(),
+            ],
+        );
+        assert_eq!(
+            c,
+            r#""C:\Program Files\DriftWin\driftwin.exe" --only a.exe,b.exe --config "C:\My Dir\c.toml""#
+        );
+    }
+
     use super::*;
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> ScreenRect {
