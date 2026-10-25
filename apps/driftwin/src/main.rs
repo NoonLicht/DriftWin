@@ -31,9 +31,12 @@ mod capture;
 mod deco;
 mod onboarding;
 mod shot;
+mod smooth;
 mod suspend;
 
 /// Через сколько без нажатий переключатель MRU фиксирует выбор.
+/// Сколько тиков (при 60 Гц) оверлей ждёт первые кадры окон перед переездом камеры.
+const PAN_WAIT_TICKS: u8 = 12;
 const CYCLE_COMMIT: Duration = Duration::from_millis(1500);
 
 /// Минимальный размер окна при изменении размера мышью и клавишами, мир.
@@ -448,6 +451,10 @@ struct App {
     drag: Option<Drag>,
     /// Окно на весь монитор и его прежний прямоугольник.
     fullscreen: Option<(WindowId, Rect)>,
+    /// Кнопки «свернуть» и «закрыть» над окном, открытым на весь экран.
+    chrome: dw_render::Chrome,
+    /// Окно, которое откроется на весь экран, когда масштаб дойдёт до 1.0.
+    open_pending: Option<WindowId>,
     /// Для повторного fit/fill: (прямоугольник до, прямоугольник после).
     undo: HashMap<WindowId, (Rect, Rect)>,
     /// Окна, которым меняли размер: проверить, принял ли его процесс.
@@ -459,6 +466,15 @@ struct App {
     /// Масштаб вида (1.0 — обычный режим, меньше — обзор через миниатюры) и его цель.
     zoom: f64,
     zoom_target: f64,
+    /// Пружины камеры и масштаба: плавный разгон и остановка вместо «доли пути за кадр».
+    glide: smooth::Glide,
+    zoom_glide: smooth::ZoomGlide,
+    /// Длинный переезд камеры на масштабе 1 (бэкенд `capture`): окна на это время рисует GPU-оверлей,
+    /// настоящие стоят на месте и встают на конечные места по окончании. Без этого каждое приложение
+    /// принимает асинхронный `SetWindowPos` в свой момент, и движение рваное.
+    pan_overlay: bool,
+    /// Тики ожидания первых кадров окон после показа оверлея, пока камера ещё не тронулась.
+    pan_wait: u8,
     /// Камера до `zoom-to-fit`, чтобы вернуться повтором или правым кликом.
     overview_prev: Option<Vec2>,
     /// По оверлею обзора на каждый управляемый монитор.
@@ -707,6 +723,8 @@ impl App {
     fn leave_overview_now(&mut self) {
         self.zoom = 1.0;
         self.zoom_target = 1.0;
+        self.zoom_glide.rest();
+        self.open_pending = None;
         self.overview_prev = None;
         self.hide_in = 0;
         for o in &mut self.overlays {
@@ -716,11 +734,24 @@ impl App {
 
     /// Выйти из обзора с анимацией; если камеру двигал `zoom-to-fit`, вернуть её на место.
     fn leave_overview(&mut self) {
+        self.open_pending = None;
         self.zoom_target = 1.0;
         if let Some(p) = self.overview_prev.take() {
             self.inertia.stop();
             self.target = p;
         }
+    }
+
+    /// Стоит ли на этот переезд камеры подменить окна оверлеем (см. `pan_overlay`).
+    fn should_pan_overlay(&self, from: Vec2) -> bool {
+        let d = self.target - from;
+        d.x.hypot(d.y) > 400.0
+            && self.zoom >= 0.999
+            && self.zoom_target >= 0.999
+            && self.drag.is_none()
+            && self.fullscreen.is_none()
+            && self.overlays.first().is_some_and(Overlay::is_capture)
+            && !self.canvas.navigable().any(|id| self.canvas.is_pinned(id))
     }
 
     fn bg_cfg(&self) -> BgCfg {
@@ -730,6 +761,8 @@ impl App {
             BgType::None => BgKind::None,
             BgType::Solid => BgKind::Solid,
             BgType::Grid => BgKind::Grid,
+            BgType::Aurora => BgKind::Aurora,
+            BgType::Fractal => BgKind::Fractal,
             BgType::Tile => BgKind::Tile,
             BgType::Wallpaper => BgKind::Wallpaper,
         };
@@ -753,9 +786,8 @@ impl App {
         kind: dw_render::Kind,
         rect: (i32, i32, i32, i32),
     ) -> Option<Overlay> {
-        if kind == dw_render::Kind::Overview
-            && self.cfg.zoom.backend == dw_config::ZoomBackend::Capture
-            && let Some(o) = self.capture_overlay(rect)
+        if self.cfg.zoom.backend == dw_config::ZoomBackend::Capture
+            && let Some(o) = self.capture_overlay(kind, rect)
         {
             return Some(o);
         }
@@ -877,7 +909,7 @@ impl App {
                     hwnd: id.0 as isize,
                     rect: self.canvas.rect(id)?,
                     border: (m.border.l, m.border.t, m.border.r, m.border.b),
-                    focused: fg == Some(id),
+                    focused: fg == Some(id) && !self.pan_overlay,
                     title: m.title.clone(),
                 })
             })
@@ -896,22 +928,43 @@ impl App {
         if self.zoom == self.zoom_target {
             return;
         }
-        let (a, b) = (self.zoom.ln(), self.zoom_target.ln());
-        if (b - a).abs() < 0.004 {
-            self.zoom = self.zoom_target;
-        } else {
-            self.zoom = (a + (b - a) * (1.0 - (-dt * 14.0).exp())).exp();
-        }
+        self.zoom = self.zoom_glide.step(self.zoom, self.zoom_target, dt);
         if self.zoom >= 0.999 {
             self.zoom = 1.0;
             // окна встают на места камеры, пока оверлей ещё закрывает экран
             self.force_layout = true;
+            // выбранное окно открывается на весь экран и остаётся таким, пока его не свернут
+            if let Some(id) = self.open_pending.take()
+                && self.canvas.contains(id)
+            {
+                self.enter_fullscreen(id);
+            }
+        }
+    }
+
+    /// Окно, внутри которого лежит точка мира `p`.
+    fn window_at_world(&self, p: Vec2) -> Option<WindowId> {
+        self.canvas.navigable().find(|id| {
+            self.canvas.rect(*id).is_some_and(|r| {
+                (p.x - r.center.x).abs() <= r.w / 2.0 && (p.y - r.center.y).abs() <= r.h / 2.0
+            })
+        })
+    }
+
+    /// Показать или спрятать кнопки «свернуть» и «закрыть» в правом верхнем углу вида.
+    fn sync_chrome(&mut self) {
+        if self.fullscreen.is_some() && !self.in_overview() && !self.pan_overlay {
+            let b = self.geo.bounds;
+            self.chrome
+                .show_at(b.0 + b.2 - dw_render::CHROME_WIDTH - 10, b.1 + 8);
+        } else {
+            self.chrome.hide();
         }
     }
 
     /// Показать/обновить/убрать оверлей обзора и фон рабочего стола.
     fn sync_overlay(&mut self) {
-        let active = self.zoom < 0.999;
+        let active = self.zoom < 0.999 || self.pan_overlay;
         let visible = self.overlays.first().is_some_and(Overlay::is_visible);
         if active || visible {
             let mut scene = self.scene();
@@ -962,6 +1015,7 @@ impl App {
     }
 
     fn zoom_to_fit(&mut self, snapped: bool) {
+        self.open_pending = None;
         if !snapped && self.zoom_target < 0.999 {
             self.leave_overview();
             return;
@@ -1001,6 +1055,9 @@ impl App {
     }
 
     fn zoom_step_by(&mut self, zoom_in: bool) {
+        if zoom_in && self.zoom_target >= 0.999 {
+            return;
+        }
         let s = self.cfg.zoom.step;
         let z = if zoom_in {
             self.zoom_target * s
@@ -1008,11 +1065,15 @@ impl App {
             self.zoom_target / s
         };
         self.set_zoom_target(z);
+        if zoom_in && self.zoom_target >= 0.999 {
+            self.open_pending = self.window_at_world(self.target);
+        }
     }
 
     fn set_zoom_target(&mut self, z: f64) {
         let z = z.clamp(self.cfg.zoom.min, 1.0);
         self.exit_fullscreen();
+        self.open_pending = None;
         self.zoom_target = if z > 0.98 { 1.0 } else { z };
     }
 
@@ -1028,6 +1089,11 @@ impl App {
                 self.close_stub(WindowId(key));
                 return;
             }
+            _ => {}
+        }
+        match ev {
+            Event::ChromeMinimize => return self.minimize_open(),
+            Event::ChromeClose => return self.close_open(),
             _ => {}
         }
         if let Event::GhostClick(key) = ev {
@@ -1049,6 +1115,7 @@ impl App {
                     self.go_to(id);
                     if self.cfg.zoom.click_exits || matches!(ev, Event::DoubleClick(_)) {
                         self.zoom_target = 1.0;
+                        self.open_pending = Some(id);
                     }
                 }
             }
@@ -1074,11 +1141,37 @@ impl App {
                 let nz = self.zoom_target;
                 self.inertia.stop();
                 self.target = Vec2::new(px - sx / nz, py + sy / nz);
+                // доехали до максимума: окно под курсором откроется на весь экран
+                if nz >= 0.999 && steps > 0.0 {
+                    self.open_pending = self.window_at_world(Vec2::new(px, py));
+                }
             }
             Event::Back => self.leave_overview(),
             Event::Mouse { msg, x, y, wp } => self.capture_mouse(msg, x, y, wp),
-            Event::GhostClick(_) | Event::StubLaunch(_) | Event::StubClose(_) => {}
+            Event::GhostClick(_)
+            | Event::StubLaunch(_)
+            | Event::StubClose(_)
+            | Event::ChromeMinimize
+            | Event::ChromeClose => {}
         }
+    }
+
+    /// «Свернуть» окно, открытое на весь экран: вернуть его на место и показать обзор.
+    fn minimize_open(&mut self) {
+        self.exit_fullscreen();
+        self.zoom_to_fit(false);
+    }
+
+    /// «Закрыть» окно, открытое на весь экран, и вернуться в обзор.
+    fn close_open(&mut self) {
+        let Some((id, _)) = self.fullscreen else {
+            return;
+        };
+        self.exit_fullscreen();
+        if let Some(m) = self.managed.get(&id) {
+            dw_win::close(m);
+        }
+        self.zoom_to_fit(false);
     }
 
     /// Частота кадров: из конфига или по самому быстрому из управляемых мониторов.
@@ -1098,6 +1191,7 @@ impl App {
     fn tick(&mut self) {
         self.tick_inner();
         self.sync_overlay();
+        self.sync_chrome();
     }
 
     fn tick_inner(&mut self) {
@@ -1113,21 +1207,38 @@ impl App {
             let c = self.canvas.viewport.center;
             self.canvas.viewport.center = Vec2::new(c.x + d.x, c.y + d.y);
             self.target = self.canvas.viewport.center;
+            self.glide.rest(self.target);
         } else {
             let c = self.canvas.viewport.center;
-            let d = self.target - c;
-            if d.x != 0.0 || d.y != 0.0 {
-                if d.x.abs() < 0.5 && d.y.abs() < 0.5 {
-                    self.canvas.viewport.center = self.target;
+            if self.target == c {
+                self.glide.rest(c);
+            } else {
+                if !self.pan_overlay && self.should_pan_overlay(c) {
+                    self.pan_overlay = true;
+                    self.pan_wait = PAN_WAIT_TICKS;
+                }
+                if self.pan_wait > 0 {
+                    // минимум несколько кадров с оверлеем без движения, дальше ждём кадры окон, но не дольше предела
+                    let ready = self.overlays.first().is_some_and(Overlay::frames_ready);
+                    self.pan_wait = if ready && self.pan_wait <= PAN_WAIT_TICKS - 3 {
+                        0
+                    } else {
+                        self.pan_wait - 1
+                    };
                 } else {
-                    // доля пути за кадр пересчитана на реальное время кадра: на 180 Гц камера едет так же быстро, как на 60
-                    let k = 1.0 - (1.0 - self.cfg.navigation.camera_speed).powf(dt * 60.0);
-                    self.canvas.viewport.center = Vec2::new(c.x + d.x * k, c.y + d.y * k);
+                    self.canvas.viewport.center =
+                        self.glide
+                            .step(c, self.target, dt, self.cfg.navigation.camera_speed);
                 }
             }
         }
-        // в обзоре настоящие окна стоят на месте: их картинку двигает оверлей
-        if self.zoom < 0.999 {
+        if self.pan_overlay && self.pan_wait == 0 && self.canvas.viewport.center == self.target {
+            // приехали: настоящие окна встают на места, пока оверлей ещё закрывает экран
+            self.pan_overlay = false;
+            self.force_layout = true;
+        }
+        // в обзоре и при длинном переезде настоящие окна стоят на месте: их картинку двигает оверлей
+        if self.zoom < 0.999 || self.pan_overlay {
             return;
         }
         if !self.force_layout && self.canvas.viewport.center == self.applied {
@@ -1400,6 +1511,10 @@ impl App {
         let Some(id) = self.focused_nav() else {
             return;
         };
+        self.enter_fullscreen(id);
+    }
+
+    fn enter_fullscreen(&mut self, id: WindowId) {
         let Some(prev) = self.canvas.rect(id) else {
             return;
         };
@@ -1689,17 +1804,19 @@ impl App {
     }
 
     fn run_action(&mut self, a: Action) {
-        // любое действие с холстом выводит окно из полноэкранного режима
-        if !matches!(
-            a,
-            Action::ToggleFullscreen
-                | Action::CloseWindow
-                | Action::Quit
-                | Action::ReloadConfig
-                | Action::ToggleCursorPan
-                | Action::GapIncrease
-                | Action::GapDecrease
-        ) {
+        // любое действие с холстом выводит окно из полноэкранного режима; приближать дальше некуда
+        if !(matches!(a, Action::ZoomIn) && self.zoom_target >= 0.999)
+            && !matches!(
+                a,
+                Action::ToggleFullscreen
+                    | Action::CloseWindow
+                    | Action::Quit
+                    | Action::ReloadConfig
+                    | Action::ToggleCursorPan
+                    | Action::GapIncrease
+                    | Action::GapDecrease
+            )
+        {
             self.exit_fullscreen();
         }
         match a {
@@ -2094,6 +2211,8 @@ fn main() -> Result<()> {
         last_cycle: None,
         drag: None,
         fullscreen: None,
+        chrome: dw_render::Chrome::new(),
+        open_pending: None,
         undo: HashMap::new(),
         size_checks: Vec::new(),
         cursor_pan_on: false,
@@ -2101,6 +2220,10 @@ fn main() -> Result<()> {
         in_corner: None,
         zoom: 1.0,
         zoom_target: 1.0,
+        glide: smooth::Glide::default(),
+        zoom_glide: smooth::ZoomGlide::default(),
+        pan_overlay: false,
+        pan_wait: 0,
         overview_prev: None,
         overlays: Vec::new(),
         desk_bgs: Vec::new(),

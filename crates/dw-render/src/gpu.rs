@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -54,9 +54,60 @@ V vs(uint id : SV_VertexID) {
     o.uv = c;
     return o;
 }
+float hash(float2 p) {
+    // без sin: на 3440x1440 пикселях синусы дорого стоят
+    float3 q = frac(float3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return frac((q.x + q.y) * q.z);
+}
+float vnoise(float2 p) {
+    float2 i = floor(p), f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(hash(i), hash(i + float2(1, 0)), f.x), lerp(hash(i + float2(0, 1)), hash(i + float2(1, 1)), f.x), f.y);
+}
+float fbm(float2 p) {
+    float s = 0.0, a = 0.5;
+    [unroll] for (int k = 0; k < 4; k++) { s += a * vnoise(p); p = p * 2.03 + float2(17.1, 9.2); a *= 0.5; }
+    return s;
+}
 float4 ps(V i) : SV_Target {
+    if (par.x > 3.5) {
+        // fractal: fbm с двойным искажением координат, пастельная косинусная палитра; par.yz — начало, par.w — высота вида
+        float2 p = (i.pos.xy - par.yz) / par.w * 0.9;
+        float2 q = float2(fbm(p), fbm(p + float2(5.2, 1.3)));
+        float2 r = q;
+        float f = fbm(p + 2.5 * q);
+        // узкая палитра: розовый - лаванда - голубой - мятный, без грязных промежуточных оттенков
+        float t = saturate(f * 1.5 + r.x * 0.5 - 0.35);
+        float3 pal = float3(0.95, 0.62, 0.80) * (1.0 - t) * (1.0 - t)
+                   + float3(0.62, 0.58, 0.97) * 2.0 * t * (1.0 - t)
+                   + float3(0.45, 0.85, 0.92) * t * t;
+        float m = smoothstep(0.15, 0.85, f + 0.3 * (q.x - 0.5));
+        float lum = dot(color.rgb, float3(0.333, 0.333, 0.333));
+        // на светлой основе пастель ярче, на тёмной глуше
+        // на тёмной основе узор тоньше и глуше, на светлой ярче
+        float3 col = lerp(color.rgb, pal * (0.55 + 0.45 * lum), (0.08 + 0.32 * m) * (0.55 + 0.9 * lum));
+        col += (hash(i.pos.xy) - 0.5) / 255.0;
+        return float4(col, 1);
+    }
     if (par.x < 0.5) return color;
     if (par.x < 1.5) return float4(tex.Sample(smp, i.uv).rgb, 1);
+    if (par.x > 2.5) {
+        // aurora: числа те же, что GLOWS в paint.rs; par.yz — начало пятен, par.w — высота вида
+        static const float4 gl[3] = { float4(-0.55, -0.25, 0.85, 0.32), float4(0.55, 0.25, 0.75, 0.24), float4(0.0, 0.6, 0.65, 0.18) };
+        static const float3 gc[3] = { float3(0.302, 0.349, 0.949), float3(0.102, 0.651, 0.702), float3(0.749, 0.302, 0.702) };
+        float3 col = color.rgb * (1.18 - 0.36 * i.uv.y);
+        float2 per = par.w * float2(2.6, 1.7);
+        [unroll] for (int k = 0; k < 3; k++) {
+            float2 d = i.pos.xy - (par.yz + gl[k].xy * par.w);
+            d -= per * round(d / per);
+            float t2 = min(dot(d, d) / (gl[k].z * par.w * gl[k].z * par.w), 1.0);
+            col = lerp(col, gc[k], gl[k].w * (1.0 - t2) * (1.0 - t2));
+        }
+        // шум в долю младшего разряда, чтобы градиент не полосатил
+        col += (frac(sin(dot(i.pos.xy, float2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
+        return float4(col, 1);
+    }
     float2 m = fmod(abs(i.pos.xy - par.yz), par.w);
     float2 d = min(m, par.w - m);
     return (d.x < 0.75 || d.y < 0.75) ? color2 : color;
@@ -79,6 +130,9 @@ struct Frame {
 /// Состояние окна, общее с потоком кадров WGC.
 struct Shared {
     frame: Mutex<Option<Frame>>,
+    /// Последний пришедший кадр WGC: копирование в текстуру и мипы делает отрисовка, не обработчик (иначе при
+    /// десятке живых окон главный цикл тонет в работе по 60 кадров в секунду на окно).
+    pending: Mutex<Option<Direct3D11CaptureFrame>>,
     /// Размер, под который настроен пул кадров.
     pool_size: Mutex<(i32, i32)>,
 }
@@ -115,10 +169,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct Hub(Arc<Inner>);
 
-/// Устройство и контекст для обработчика кадров, который WGC вызывает из своих потоков.
+/// Устройство WinRT для обработчика кадров, который WGC вызывает из своих потоков.
 struct GpuHandles {
-    dev: ID3D11Device,
-    ctx: ID3D11DeviceContext,
     winrt: IDirect3DDevice,
 }
 unsafe impl Send for GpuHandles {}
@@ -271,23 +323,22 @@ impl Hub {
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &inner.winrt,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            3,
             size,
         )?;
         let shared = Arc::new(Shared {
             frame: Mutex::new(None),
+            pending: Mutex::new(None),
             pool_size: Mutex::new((size.Width, size.Height)),
         });
         {
             let (shared, seq) = (shared.clone(), inner.seq.clone());
             let gpu = GpuHandles {
-                dev: inner.dev.clone(),
-                ctx: inner.ctx.clone(),
                 winrt: inner.winrt.clone(),
             };
             pool.FrameArrived(&TypedEventHandler::new(
                 move |p: windows::core::Ref<Direct3D11CaptureFramePool>, _| {
-                    let GpuHandles { dev, ctx, winrt } = &gpu;
+                    let GpuHandles { winrt } = &gpu;
                     let Some(pool) = p.as_ref() else {
                         return Ok(());
                     };
@@ -295,31 +346,10 @@ impl Hub {
                         return Ok(());
                     };
                     let cs = frame.ContentSize()?;
-                    let acc = frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?;
-                    let src: ID3D11Texture2D = unsafe { acc.GetInterface()? };
-                    if let Ok(mut slot) = shared.frame.lock() {
-                        if slot
-                            .as_ref()
-                            .is_none_or(|f| (f.w, f.h) != (cs.Width, cs.Height))
-                        {
-                            *slot = make_frame(dev, cs.Width, cs.Height).ok();
-                        }
-                        if let Some(f) = slot.as_ref() {
-                            let b = D3D11_BOX {
-                                left: 0,
-                                top: 0,
-                                front: 0,
-                                right: cs.Width as u32,
-                                bottom: cs.Height as u32,
-                                back: 1,
-                            };
-                            unsafe {
-                                ctx.CopySubresourceRegion(&f.tex, 0, 0, 0, 0, &src, 0, Some(&b));
-                                ctx.GenerateMips(&f.srv);
-                            }
-                            seq.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if let Ok(mut slot) = shared.pending.lock() {
+                        *slot = Some(frame);
                     }
+                    seq.fetch_add(1, Ordering::Relaxed);
                     // размер окна изменился: пул нужно подстроить, иначе кадры обрезаются
                     if let Ok(mut ps) = shared.pool_size.lock()
                         && *ps != (cs.Width, cs.Height)
@@ -328,7 +358,7 @@ impl Hub {
                         let _ = pool.Recreate(
                             winrt,
                             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                            2,
+                            3,
                             SizeInt32 {
                                 Width: cs.Width,
                                 Height: cs.Height,
@@ -363,6 +393,48 @@ impl Hub {
                 .filter(|s| s.shared.frame.lock().is_ok_and(|f| f.is_some()))
                 .count()
         })
+    }
+}
+
+/// Перенести последний кадр WGC в текстуру окна и построить мипы (раз за перерисовку, из потока окна).
+fn upload(inner: &Inner, sh: &Shared) {
+    let Some(frame) = sh.pending.lock().ok().and_then(|mut p| p.take()) else {
+        return;
+    };
+    let Ok(cs) = frame.ContentSize() else { return };
+    let Ok(acc) = frame
+        .Surface()
+        .and_then(|s| s.cast::<IDirect3DDxgiInterfaceAccess>())
+    else {
+        return;
+    };
+    let Ok(src) = (unsafe { acc.GetInterface::<ID3D11Texture2D>() }) else {
+        return;
+    };
+    let Ok(mut slot) = sh.frame.lock() else {
+        return;
+    };
+    if slot
+        .as_ref()
+        .is_none_or(|f| (f.w, f.h) != (cs.Width, cs.Height))
+    {
+        *slot = make_frame(&inner.dev, cs.Width, cs.Height).ok();
+    }
+    if let Some(f) = slot.as_ref() {
+        let b = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: cs.Width as u32,
+            bottom: cs.Height as u32,
+            back: 1,
+        };
+        unsafe {
+            inner
+                .ctx
+                .CopySubresourceRegion(&f.tex, 0, 0, 0, 0, &src, 0, Some(&b));
+            inner.ctx.GenerateMips(&f.srv);
+        }
     }
 }
 
@@ -529,6 +601,32 @@ impl Surface {
                 let oy = (scene.center.y as f32) * z + scene.view.1 as f32 / 2.0 - off.1 as f32;
                 self.draw(full, c(bg.color), c(bg.grid_color), [2.0, ox, oy, step]);
             }
+            BgKind::Aurora => {
+                let ox = (-scene.center.x * scene.zoom) + f64::from(scene.view.0) / 2.0
+                    - f64::from(off.0);
+                let oy =
+                    scene.center.y * scene.zoom + f64::from(scene.view.1) / 2.0 - f64::from(off.1);
+                let ((ax, ay), hh) = crate::paint::aurora_origin(scene, off, (ox, oy));
+                self.draw(
+                    full,
+                    c(bg.color),
+                    [0.0; 4],
+                    [3.0, ax as f32, ay as f32, hh as f32],
+                );
+            }
+            BgKind::Fractal => {
+                let ox = (-scene.center.x * scene.zoom) + f64::from(scene.view.0) / 2.0
+                    - f64::from(off.0);
+                let oy =
+                    scene.center.y * scene.zoom + f64::from(scene.view.1) / 2.0 - f64::from(off.1);
+                let ((ax, ay), hh) = crate::paint::aurora_origin(scene, off, (ox, oy));
+                self.draw(
+                    full,
+                    c(bg.color),
+                    [0.0; 4],
+                    [4.0, ax as f32, ay as f32, hh as f32],
+                );
+            }
             BgKind::None => self.draw(full, [0.0, 0.0, 0.0, 1.0], [0.0; 4], [0.0; 4]),
             _ => self.draw(full, c(bg.color), [0.0; 4], [0.0; 4]),
         }
@@ -554,6 +652,7 @@ impl Surface {
             .ok()
             .and_then(|m| m.get(&it.key).map(|s| s.shared.clone()))
             .and_then(|sh| {
+                upload(inner, &sh);
                 sh.frame
                     .lock()
                     .ok()
