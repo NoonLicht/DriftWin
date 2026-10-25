@@ -81,10 +81,10 @@
 - Исходный размер окна, которому менялся размер, сохраняется в `baseline.json` и возвращается при выходе.
 
 ## Принято, но пока не работает
-`autostart`; `[decorations]`, `[effects]`, `[gestures]`, `[touch]`, `[outputs]`; в `[navigation]` — `trackpad_speed`, `touch_speed`, `drift`, `auto_navigate_on_*`, `nudge_step`,
+`autostart` (список программ в конфиге; автозапуск самого DriftWin — `driftwin --autostart`, см. «Этап 8»); `[effects]`, `[gestures]`, `[touch]`, `[outputs]`; в `[navigation]` — `trackpad_speed`, `touch_speed`, `drift`, `auto_navigate_on_*`, `nudge_step`,
 `anchors`; `[outputs]` и горячие углы по мониторам; в `[windows]` — `elevated="notify"`, `park_limit`, `on_exit="bring_to_view"`,
 `disable_when_fullscreen`; в правилах — `fullscreen`, `focus_on_open`,
-`preserve_aspect_ratio`, `decoration`, `blur`, `opacity`, `border_*`, `corner_radius`, `shadow`, `output`, `pass_keys`,
+`preserve_aspect_ratio`, `decoration`, `blur`, `border_width`, `border_color_focused`, `corner_radius`, `shadow`, `output`, `pass_keys`,
 `pass_mouse`, `layer_order`; действия `exec*`, `spawn`, `move-to-bookmark`, `send-to-output` и др. (§2.12 плана).
 `toggle-fullscreen` растягивает окно на монитор, но стиль окна (рамку, заголовок) не меняет.
 Мышь: `[mouse.on-window]`/`on-canvas`, `resize_on_border`, `decoration_*`.
@@ -231,3 +231,42 @@ driftwinctl [--json] msg camera X Y [--relative] | zoom L | focus W | move W X Y
 ### `state.txt`
 `key=value` примерно 10 раз в секунду (только при изменении): `camera_x`, `camera_y`, `zoom`, `windows`, `suspended`, `focused`,
 `focused_app`, `active_bookmark`, `paused`.
+
+## Этап 8: оформление, автозапуск, установка
+
+### `[decorations]` и правила окон
+Оформление окон средствами DWM (Windows 11, сборка 22000+; на старых системах атрибуты отвергаются и ничего не меняется).
+Те же ключи можно задать в `[[window_rules]]`: правило важнее глобальной секции, поздние правила важнее ранних.
+```toml
+[decorations]
+corner = "round"            # keep | default | square | round | small
+border_color = "#5b8def"    # #rrggbb | none (без рамки) | keep
+backdrop = "keep"           # keep | none | mica | acrylic | tabbed
+opacity = 1.0               # 0.1..1.0; 1.0 — не менять
+
+[[window_rules]]
+app_id = "notepad.exe"
+corner = "square"
+opacity = 0.9
+```
+`keep` (или отсутствие ключа) — не менять. Применяется раз в секунду ко всем окнам под управлением, поэтому подхватываются
+новые окна и правки конфига; когда окно перестаёт подпадать под правило, а также при выходе из программы, прежние значения
+возвращаются. `backdrop` виден только у приложений, растягивающих рамку на клиентскую область (проводник, Терминал, WinUI);
+`opacity` включает слой `WS_EX_LAYERED` и не трогает окна, у которых он уже есть. Цвет рамки системой не читается, поэтому
+«прежним» считается системный. Если DriftWin упадёт, оформление остаётся до закрытия окон (аварийный возврат двигает окна, но не
+оформление). Ошибки значений — ошибка конфига с номером строки.
+
+### Автозапуск и первый запуск
+`driftwin --autostart on|off|status` пишет или удаляет значение `DriftWin` в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+Остальные аргументы (`--only …`, `--all`, `--config …`) попадают в команду автозапуска. Демон стартует в безопасном режиме, поэтому
+нужны `[windows] only` в конфиге или `--all`. При первом запуске (нет файла `onboarding.done` в каталоге состояния; при явном
+`--state-dir` не показывается) выводится окно с памяткой по клавишам и аварийной клавишей; тот же текст печатает
+`driftwin --onboarding`.
+
+### Установка
+`scripts\package.ps1` собирает release, кладёт exe, `config.example.toml`, `LICENSE`, `README.md` и справку в
+`dist\DriftWin-<версия>-win-x64.zip` (портативная версия). Если установлен Inno Setup 6, по `installer\driftwin.iss` собирается
+установщик `dist\DriftWin-<версия>-setup.exe`: установка на пользователя без прав администратора, необязательный автозапуск,
+ярлык в меню Пуск, при удалении демону отправляется `quit` (он возвращает окна на экран). С ключом `-Sign` исполняемые файлы
+подписываются `signtool` сертификатом из хранилища пользователя; отпечаток берётся из переменной `DRIFTWIN_SIGN_THUMBPRINT`.
+Сертификата кода у проекта нет: до его появления SmartScreen и антивирусы могут предупреждать о неподписанном файле.
