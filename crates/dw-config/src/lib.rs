@@ -98,6 +98,17 @@ pub struct Zoom {
     pub step: f64,
     /// Клик по миниатюре в обзоре сразу возвращает масштаб 1:1 (иначе только фокус и центровка; двойной клик выходит).
     pub click_exits: bool,
+    /// Чем рисуется обзор.
+    pub backend: ZoomBackend,
+}
+
+/// Бэкенд обзора (`[zoom] backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomBackend {
+    /// Живые миниатюры DWM: окна в обзоре не принимают ввод.
+    Thumbnails,
+    /// Эксперимент: окна снимаются Windows Graphics Capture и рисуются на GPU, мышь пересылается в настоящие окна.
+    Capture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,7 +987,19 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
     for k in raw.zoom.rest.keys() {
         cx.warn_at(k, format!("zoom.{k} пока не поддерживается"));
     }
+    let backend = match raw.zoom.backend.as_deref() {
+        None | Some("thumbnails") => ZoomBackend::Thumbnails,
+        Some("capture") => ZoomBackend::Capture,
+        Some(o) => {
+            cx.err_at(
+                "backend",
+                format!("zoom.backend = «{o}»: допустимо thumbnails или capture"),
+            );
+            ZoomBackend::Thumbnails
+        }
+    };
     let zoom = Zoom {
+        backend,
         min: ranged(raw.zoom.min, "min", 0.1, 0.02, 0.9, &mut cx),
         step: ranged(raw.zoom.step, "step", 1.25, 1.02, 4.0, &mut cx),
         click_exits: match raw.zoom.click.as_deref() {
@@ -991,17 +1014,6 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             }
         },
     };
-    match raw.zoom.backend.as_deref() {
-        None | Some("thumbnails") => {}
-        Some("capture") => cx.warn_at(
-            "backend",
-            "zoom.backend = \"capture\" пока не поддерживается, используется thumbnails",
-        ),
-        Some(o) => cx.err_at(
-            "backend",
-            format!("zoom.backend = «{o}»: допустимо thumbnails или capture"),
-        ),
-    }
     let background = compile_background(&raw.background, &mut cx);
     let monitors = Monitors {
         names: raw

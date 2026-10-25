@@ -64,6 +64,7 @@ expose_titles = true         # false — заголовки окон не вид
 
 [zoom]
 fit_padding = 80             # отступ при fit-window
+backend = "thumbnails"       # thumbnails | capture (эксперимент: живые кадры на GPU, мышь пересылается в окна)
 min = 0.1                    # нижняя граница обзора; верхняя всегда 1.0
 step = 1.25                  # шаг zoom-in / zoom-out / колеса в обзоре
 

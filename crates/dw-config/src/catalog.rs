@@ -293,6 +293,14 @@ pub const SETTINGS: &[Setting] = &[
         "Насколько окно меньше вида после подгонки.",
     ),
     s(
+        "zoom",
+        "backend",
+        Kind::Choice(&["thumbnails", "capture"]),
+        Def::Str("thumbnails"),
+        "Бэкенд обзора",
+        "thumbnails — живые миниатюры DWM, окна в обзоре не принимают ввод. capture (эксперимент) — окна снимаются Windows Graphics Capture и рисуются на GPU; клики, колесо и перетаскивание пересылаются в настоящие окна.",
+    ),
+    s(
         "monitors",
         "use",
         Kind::Monitors,

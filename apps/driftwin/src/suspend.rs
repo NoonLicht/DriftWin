@@ -99,6 +99,7 @@ pub(crate) struct Ext {
     /// Когда последний раз левая кнопка была нажата на панели задач или её миниатюрах.
     pub taskbar_click: Option<Instant>,
     pub deco: crate::deco::DecoState,
+    pub cap: crate::capture::CapState,
 }
 
 impl Ext {
@@ -124,6 +125,7 @@ impl Ext {
             counters: Counters::default(),
             taskbar_click: None,
             deco: Default::default(),
+            cap: Default::default(),
         }
     }
 }

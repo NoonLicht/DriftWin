@@ -1336,3 +1336,94 @@ mod autostart_tests {
         assert_eq!(autostart_status(name), None);
     }
 }
+
+// ---------- пересылка мыши в окно, не лежащее под курсором (бэкенд обзора `capture`) ----------
+
+/// Куда попала пересланная мышь.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forwarded {
+    /// Клиентская область окна или его дочернего окна: сообщение отправлено.
+    Client,
+    /// Кнопка закрытия: при отпускании отправлено `SC_CLOSE`.
+    Close,
+    /// Заголовок: окно можно перетаскивать по холсту.
+    Caption,
+    /// Прочая неклиентская область (рамка, кнопки сворачивания): ничего не делаем.
+    Other,
+}
+
+fn pack_lparam(x: i32, y: i32) -> LPARAM {
+    LPARAM((i32::from(y as i16) as isize) << 16 | (x as i16 as u16 as isize))
+}
+
+/// Переслать сообщение мыши окну. `origin` — где окно (видимый кадр) находится на самом деле, `local` — точка
+/// внутри видимого кадра. Окно может лежать за экраном: нужные координаты считаются от его настоящего места.
+///
+/// Как и система, сначала спрашиваем `WM_NCHITTEST`; клиентские клики уходят самому глубокому дочернему окну в его
+/// координатах через `PostMessage`. Мышь не двигается, окно не перемещается.
+pub fn forward_mouse(
+    id: WindowId,
+    origin: (i32, i32),
+    local: (f64, f64),
+    msg: u32,
+    wp: usize,
+) -> Forwarded {
+    use windows::Win32::Foundation::{POINT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{MapWindowPoints, ScreenToClient};
+    let h = hwnd_of(id);
+    let p = POINT {
+        x: origin.0 + local.0.round() as i32,
+        y: origin.1 + local.1.round() as i32,
+    };
+    let mut ht = 0usize;
+    unsafe {
+        let r = SendMessageTimeoutW(
+            h,
+            WM_NCHITTEST,
+            WPARAM(0),
+            pack_lparam(p.x, p.y),
+            SMTO_ABORTIFHUNG,
+            100,
+            Some(&mut ht),
+        );
+        if r.0 == 0 {
+            return Forwarded::Other;
+        }
+    }
+    // HTCLIENT = 1, HTCAPTION = 2, HTCLOSE = 20
+    match ht {
+        1 => {}
+        2 => return Forwarded::Caption,
+        20 => {
+            if msg == WM_LBUTTONUP {
+                unsafe {
+                    let _ = PostMessageW(Some(h), WM_SYSCOMMAND, WPARAM(0xF060), LPARAM(0));
+                }
+            }
+            return Forwarded::Close;
+        }
+        _ => return Forwarded::Other,
+    }
+    unsafe {
+        let mut cur = h;
+        let mut pt = p;
+        let _ = ScreenToClient(cur, &mut pt);
+        for _ in 0..8 {
+            let child = ChildWindowFromPointEx(cur, pt, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+            if child.0.is_null() || child == cur {
+                break;
+            }
+            let mut q = [pt];
+            MapWindowPoints(Some(cur), Some(child), &mut q);
+            pt = q[0];
+            cur = child;
+        }
+        let lp = if msg == WM_MOUSEWHEEL {
+            pack_lparam(p.x, p.y)
+        } else {
+            pack_lparam(pt.x, pt.y)
+        };
+        let _ = PostMessageW(Some(cur), msg, WPARAM(wp), lp);
+    }
+    Forwarded::Client
+}

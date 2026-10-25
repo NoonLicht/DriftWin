@@ -5,6 +5,7 @@
 //! Все вызовы — из потока, который качает сообщения (в демоне это главный поток).
 
 mod ghost;
+mod gpu;
 mod paint;
 mod stub;
 
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub use ghost::{GhostItem, Ghosts};
+pub use gpu::Hub;
 pub use stub::{
     MIN_SIDE as STUB_MIN_SIDE, STUB_CLASS, create_stub, destroy_stub, set_stub_launching,
 };
@@ -108,6 +110,28 @@ pub enum Event {
     StubLaunch(u64),
     /// Кнопка закрытия заглушки: убрать её.
     StubClose(u64),
+    /// Сырое событие мыши на оверлее бэкенда `capture`: сообщение Windows (`WM_*`), позиция в координатах общего вида,
+    /// `wp` — `wParam` (клавиши-модификаторы; у колеса старшее слово — дельта).
+    Mouse { msg: u32, x: i32, y: i32, wp: usize },
+}
+
+/// Позиция точки `(x, y)` вида внутри окна `key` (в его немасштабированных пикселях), даже если точка вне окна.
+pub fn local_in(scene: &Scene, key: u64, x: i32, y: i32) -> Option<(f64, f64)> {
+    let it = scene.items.iter().find(|it| it.key == key)?;
+    let r = screen_rect(scene, (0, 0), &it.rect);
+    let z = scene.zoom.max(1e-6);
+    Some((f64::from(x - r.left) / z, f64::from(y - r.top) / z))
+}
+
+/// Окно под точкой `(x, y)` вида: ключ и позиция внутри видимого кадра окна в его собственных (немасштабированных)
+/// пикселях. Окна ищутся сверху вниз.
+pub fn hit_test(scene: &Scene, x: i32, y: i32) -> Option<(u64, f64, f64)> {
+    let z = scene.zoom.max(1e-6);
+    scene.items.iter().rev().find_map(|it| {
+        let r = screen_rect(scene, (0, 0), &it.rect);
+        (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            .then(|| (it.key, f64::from(x - r.left) / z, f64::from(y - r.top) / z))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +155,8 @@ struct Shared {
     last_click: Option<(std::time::Instant, u64)>,
     /// Память кадра, чтобы не создавать её заново на каждой перерисовке (HDC и HBITMAP как числа).
     back: Option<paint::Back>,
+    /// Бэкенд `capture`: рисует цепочка обмена, а мышь уходит приложению как `Event::Mouse`.
+    surface: Option<gpu::Surface>,
 }
 
 static STATE: Mutex<Vec<Shared>> = Mutex::new(Vec::new());
@@ -184,9 +210,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut ps = PAINTSTRUCT::default();
             unsafe {
                 let hdc = BeginPaint(hwnd, &mut ps);
-                with_state(hwnd, |s| paint::paint(hdc, s));
+                with_state(hwnd, |s| {
+                    if s.surface.is_some() {
+                        let (off, scene, bg) =
+                            (offset(s.pos, &s.scene), s.scene.clone(), s.bg.clone());
+                        if let Some(sf) = s.surface.as_mut() {
+                            sf.render(&scene, off, &bg);
+                        }
+                    } else {
+                        paint::paint(hdc, s);
+                    }
+                });
                 let _ = EndPaint(hwnd, &ps);
             }
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+        | WM_MBUTTONUP | WM_MOUSEMOVE | WM_MOUSEWHEEL
+            if with_state(hwnd, |s| s.surface.is_some()).unwrap_or(false) =>
+        {
+            raw_mouse(hwnd, msg, wp, lp);
             return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_RBUTTONUP | WM_MOUSEWHEEL => {
@@ -203,6 +246,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+/// Мышь на оверлее `capture`: приложение само решает, что с ней делать (переслать окну, двигать холст).
+fn raw_mouse(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
+    let (mut x, mut y) = (
+        (lp.0 & 0xFFFF) as i16 as i32,
+        ((lp.0 >> 16) & 0xFFFF) as i16 as i32,
+    );
+    if msg == WM_MOUSEWHEEL {
+        // у колеса координаты экранные
+        let mut p = POINT { x, y };
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut p);
+        }
+        (x, y) = (p.x, p.y);
+    }
+    match msg {
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => unsafe {
+            SetCapture(hwnd);
+        },
+        // MK_LBUTTON | MK_RBUTTON | MK_MBUTTON = 0x13: отпущена последняя кнопка — вернуть мышь
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP if wp.0 & 0x13 == 0 => unsafe {
+            let _ = ReleaseCapture();
+        },
+        _ => {}
+    }
+    let (ox, oy) = with_state(hwnd, |s| offset(s.pos, &s.scene)).unwrap_or((0, 0));
+    push_event(Event::Mouse {
+        msg,
+        x: x + ox,
+        y: y + oy,
+        wp: wp.0,
+    });
 }
 
 fn mouse(hwnd: HWND, msg: u32, wp: WPARAM, x: i32, y: i32) {
@@ -309,6 +385,8 @@ pub struct Overlay {
     rect: (i32, i32, i32, i32),
     thumbs: HashMap<u64, Thumb>,
     visible: bool,
+    /// Бэкенд `capture`.
+    hub: Option<Hub>,
 }
 
 impl Overlay {
@@ -355,6 +433,7 @@ impl Overlay {
                 drag: None,
                 last_click: None,
                 back: None,
+                surface: None,
             });
         }
         Ok(Self {
@@ -363,7 +442,33 @@ impl Overlay {
             rect,
             thumbs: HashMap::new(),
             visible: false,
+            hub: None,
         })
+    }
+
+    /// Оверлей обзора для бэкенда `capture`: окна рисует GPU, мышь приходит как `Event::Mouse`.
+    pub fn new_capture(rect: (i32, i32, i32, i32), bg: BgCfg, hub: &Hub) -> Result<Self, String> {
+        let mut o = Self::new(Kind::Overview, rect, bg)?;
+        let surface = gpu::Surface::new(hub, o.hwnd.0 as isize, (rect.2, rect.3))?;
+        let hwnd = o.hwnd;
+        with_state(hwnd, |s| s.surface = Some(surface));
+        o.hub = Some(hub.clone());
+        Ok(o)
+    }
+
+    /// Перерисовать, если пришли новые кадры окон (только `capture`).
+    pub fn pump(&mut self) {
+        if !self.visible {
+            return;
+        }
+        let hwnd = self.hwnd;
+        if with_state(hwnd, |s| {
+            s.surface.as_ref().is_some_and(gpu::Surface::stale)
+        })
+        .unwrap_or(false)
+        {
+            self.repaint();
+        }
     }
 
     pub fn is_visible(&self) -> bool {
@@ -408,6 +513,9 @@ impl Overlay {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
+        if let Some(h) = &self.hub {
+            h.sync(&[]);
+        }
         // следующая сцена обязательно отличается: миниатюры придётся регистрировать заново
         let hwnd = self.hwnd;
         with_state(hwnd, |s| s.scene.zoom = -1.0);
@@ -432,7 +540,20 @@ impl Overlay {
         if self.visible && with_state(hwnd, |s| s.scene == *scene).unwrap_or(false) {
             return;
         }
-        if self.kind == Kind::Overview {
+        if let Some(h) = &self.hub {
+            // снимаем только окна, которые попадают на вид
+            let (vw, vh) = scene.view;
+            let shown: Vec<(u64, isize)> = scene
+                .items
+                .iter()
+                .filter(|it| {
+                    let r = screen_rect(scene, (0, 0), &it.rect);
+                    r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh
+                })
+                .map(|it| (it.key, it.hwnd))
+                .collect();
+            h.sync(&shown);
+        } else if self.kind == Kind::Overview {
             self.sync_thumbs(scene);
         }
         let hwnd = self.hwnd;
@@ -538,4 +659,53 @@ pub fn save_png(path: &std::path::Path, w: u32, h: u32, rgba: Vec<u8>) -> Result
     let img = image::RgbaImage::from_raw(w, h, rgba).ok_or("неверный размер снимка")?;
     img.save_with_format(path, image::ImageFormat::Png)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scene(zoom: f64) -> Scene {
+        let item = |key, cx, cy| Item {
+            key,
+            hwnd: 0,
+            rect: Rect {
+                center: Vec2::new(cx, cy),
+                w: 200.0,
+                h: 100.0,
+            },
+            border: (0, 0, 0, 0),
+            focused: false,
+            title: String::new(),
+        };
+        Scene {
+            center: Vec2::new(0.0, 0.0),
+            zoom,
+            view: (1000, 600),
+            origin: (0, 0),
+            // второе окно лежит поверх первого
+            items: vec![item(1, 0.0, 0.0), item(2, 50.0, 0.0)],
+        }
+    }
+
+    #[test]
+    fn hit_test_converts_overlay_point_to_window_pixels() {
+        // zoom 0.5: центр вида (500, 300); окно 1 занимает x 450..550, окно 2 — x 475..575, y 275..325
+        let s = scene(0.5);
+        let (key, lx, ly) = hit_test(&s, 500, 300).unwrap();
+        assert_eq!(key, 2);
+        // 25 px на оверлее от левого края = 50 px окна; 25 px от верха = 50 px окна
+        assert_eq!((lx.round(), ly.round()), (50.0, 50.0));
+        // верхнее окно перекрывает нижнее, а левее него виден нижний
+        assert_eq!(hit_test(&s, 460, 300).unwrap().0, 1);
+        assert!(hit_test(&s, 10, 10).is_none());
+    }
+
+    #[test]
+    fn local_in_works_outside_the_window() {
+        let s = scene(0.5);
+        let (lx, ly) = local_in(&s, 2, 450, 250).unwrap();
+        assert_eq!((lx.round(), ly.round()), (-50.0, -50.0));
+        assert!(local_in(&s, 9, 0, 0).is_none());
+    }
 }
