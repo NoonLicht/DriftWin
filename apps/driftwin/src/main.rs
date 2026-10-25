@@ -27,6 +27,8 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod suspend;
+
 /// Через сколько без нажатий переключатель MRU фиксирует выбор.
 const CYCLE_COMMIT: Duration = Duration::from_millis(1500);
 
@@ -385,10 +387,13 @@ struct App {
     bg_center: Option<Vec2>,
     /// Сколько кадров ещё держать оверлей после возврата к масштабу 1.0 (пока окна встают на места).
     hide_in: u8,
+    /// Этап 7: заглушки, сессия, IPC.
+    ext: suspend::Ext,
 }
 
 impl App {
     fn rescan(&mut self) {
+        self.ext.counters.rescans += 1;
         let (found, skipped) = dw_win::scan(&self.filter);
         // после последнего сдвига даём асинхронным SetWindowPos примениться, иначе примем отставание за ручное перемещение
         let idle = self.target == self.canvas.viewport.center
@@ -405,7 +410,7 @@ impl App {
                         || (cur.w - prev.w).abs() > 2
                         || (cur.h - prev.h).abs() > 2)
                 {
-                    if self.on_excluded_monitor(&cur) {
+                    if self.on_excluded_monitor(&cur) && !self.ext.stubs.contains_key(&m.id) {
                         released.push(m.id);
                     } else {
                         self.canvas.adopt(m.id, cur);
@@ -414,11 +419,19 @@ impl App {
                 }
                 continue;
             }
-            if self.on_excluded_monitor(&m.visible) {
+            // чужая (не наша) заглушка или заглушка, которую мы уже забыли
+            if m.class == dw_win::STUB_CLASS || self.on_excluded_monitor(&m.visible) {
                 continue;
             }
+            let claimed = self.claim_stub(&m);
             self.canvas.adopt(m.id, m.visible);
+            if let Some(r) = claimed {
+                // окно приложения встаёт на место и в размер заглушки
+                self.canvas.set_rect(m.id, r);
+                self.force_layout = true;
+            }
             self.last.insert(m.id, m.visible);
+            self.capture_launch(&m);
             let home = self.canvas.home_rect(m.id).unwrap_or(m.visible);
             tracing::info!("взято под управление: {} «{}»", m.exe, m.title);
             {
@@ -443,6 +456,9 @@ impl App {
             .map(|m| m.id)
             .collect();
         for id in dead {
+            self.on_gone(id);
+            self.ext.modes.remove(&id);
+            self.ext.opacity.remove(&id);
             self.managed.remove(&id);
             self.canvas.forget(id);
             self.mru.remove(id);
@@ -570,6 +586,10 @@ impl App {
     }
 
     fn reset(&mut self) {
+        let stubs = self.take_stubs();
+        self.ext.launch.clear();
+        self.ext.suspending.clear();
+        self.ext.closing.clear();
         self.geo = geometry(&self.cfg);
         let b = self.geo.bounds;
         self.canvas = Canvas::new((b.0, b.1), (b.2 as u32, b.3 as u32));
@@ -585,6 +605,7 @@ impl App {
         self.size_checks.clear();
         self.leave_overview_now();
         self.ghosts.clear();
+        self.rebuild_stubs(stubs);
     }
 
     // ---------- масштаб и обзор ----------
@@ -900,6 +921,17 @@ impl App {
     /// События мыши на оверлее обзора.
     fn overlay_event(&mut self, ev: dw_render::Event) {
         use dw_render::Event;
+        match ev {
+            Event::StubLaunch(key) => {
+                let _ = self.launch_stub(WindowId(key));
+                return;
+            }
+            Event::StubClose(key) => {
+                self.close_stub(WindowId(key));
+                return;
+            }
+            _ => {}
+        }
         if let Event::GhostClick(key) = ev {
             // клик по видимой части окна у границы: подвести к нему вид
             let id = WindowId(key);
@@ -946,7 +978,7 @@ impl App {
                 self.target = Vec2::new(px - sx / nz, py + sy / nz);
             }
             Event::Back => self.leave_overview(),
-            Event::GhostClick(_) => {}
+            Event::GhostClick(_) | Event::StubLaunch(_) | Event::StubClose(_) => {}
         }
     }
 
@@ -970,6 +1002,7 @@ impl App {
     }
 
     fn tick_inner(&mut self) {
+        self.ext.counters.ticks += 1;
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
         self.last_tick = now;
@@ -1002,6 +1035,7 @@ impl App {
             return;
         }
         self.force_layout = false;
+        self.ext.counters.layouts += 1;
         self.applied = self.canvas.viewport.center;
         self.last_move = now;
         let vs = dw_win::virtual_screen();
@@ -1358,6 +1392,7 @@ impl App {
             }
             _ => return,
         };
+        self.note_mode(id, a);
         self.set_rects(changes);
     }
 
@@ -1486,7 +1521,9 @@ impl App {
         if self.canvas.is_pinned(id) {
             return;
         }
-        self.mru.touch(id);
+        if !self.ext.stubs.contains_key(&id) {
+            self.mru.touch(id);
+        }
         if self.cfg.navigation.auto_navigate
             && !self.no_auto_navigate
             && !self.in_overview()
@@ -1681,16 +1718,24 @@ impl App {
                 else {
                     return;
                 };
-                if self.canvas.is_pinned(id) {
-                    self.canvas.unpin(id);
-                    self.force_layout = true;
-                } else if let Some(r) = self.canvas.screen_rect(id) {
-                    self.canvas.pin(id, r);
-                }
+                self.toggle_pin(id);
             }
             Action::CloseWindow => {
-                if let Some(m) = dw_win::foreground().and_then(|id| self.managed.get(&id)) {
-                    dw_win::close(m);
+                if let Some(id) = dw_win::foreground().filter(|id| self.managed.contains_key(id)) {
+                    if self.ext.stubs.contains_key(&id) {
+                        self.close_stub(id);
+                    } else if let Some(m) = self.managed.get(&id) {
+                        // явное закрытие: заглушку не оставляем
+                        self.ext.closing.insert(id, Instant::now());
+                        dw_win::close(m);
+                    }
+                }
+            }
+            Action::SuspendWindow => {
+                if let Some(id) = dw_win::foreground().filter(|id| self.managed.contains_key(id))
+                    && let Err(e) = self.suspend_window(id)
+                {
+                    tracing::warn!("suspend-window: {e}");
                 }
             }
             Action::ReloadConfig => self.reload_config(),
@@ -1733,6 +1778,9 @@ impl App {
                 }
             }
         }
+        self.stub_tick();
+        self.session_poll();
+        self.publish_state();
         if let Some(t) = self.last_cycle
             && t.elapsed() > CYCLE_COMMIT
         {
@@ -1950,11 +1998,18 @@ fn main() -> Result<()> {
         ghosts: dw_render::Ghosts::new(),
         bg_center: None,
         hide_in: 0,
+        ext: suspend::Ext::new(&opts.state_dir, paused.clone()),
     };
+    suspend::start_ipc(&mut app.ext);
     app.create_overlays();
     app.cursor_pan_on = app.cfg.navigation.edge_pan.cursor_pan;
     tracing::info!("частота кадров: {} Гц", app.target_fps());
+    // сессия: камера и закладки — до первого сканирования (окна встают относительно восстановленной камеры)
+    let saved_session = app.restore_camera_and_bookmarks();
     app.rescan();
+    if let Some(s) = &saved_session {
+        app.restore_windows(s);
+    }
     if let Some(z) = opts.start_zoom {
         app.set_zoom_target(z);
     }
@@ -2011,6 +2066,7 @@ fn main() -> Result<()> {
                 app.handle(ev);
             }
         }
+        app.serve_ipc();
         for ev in dw_render::drain_events() {
             if !is_paused {
                 app.overlay_event(ev);
@@ -2037,6 +2093,7 @@ fn main() -> Result<()> {
         }
     }
 
+    app.shutdown_ext();
     let n = baseline.lock().unwrap().restore();
     tracing::info!("выход: возвращено окон {n}");
     std::fs::write(&clean, b"ok")?;

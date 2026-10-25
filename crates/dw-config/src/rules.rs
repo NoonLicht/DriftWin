@@ -73,6 +73,8 @@ pub(crate) struct RawRule {
     size: Option<[i32; 2]>,
     widget: Option<bool>,
     pinned_to_screen: Option<bool>,
+    suspend_on_close: Option<bool>,
+    restore_windows: Option<bool>,
     /// Остальные ключи: известные из плана без реализации или опечатки.
     #[serde(flatten)]
     extra: BTreeMap<String, toml::Value>,
@@ -82,8 +84,6 @@ pub(crate) struct RawRule {
 const PLANNED: &[&str] = &[
     "fullscreen",
     "focus_on_open",
-    "suspend_on_close",
-    "restore_windows",
     "preserve_aspect_ratio",
     "decoration",
     "blur",
@@ -106,6 +106,8 @@ pub struct Rule {
     title: Option<Matcher>,
     widget: Option<bool>,
     pinned_to_screen: Option<bool>,
+    suspend_on_close: Option<bool>,
+    restore_windows: Option<bool>,
     position: Option<(f64, f64)>,
     size: Option<(i32, i32)>,
 }
@@ -118,6 +120,9 @@ pub struct Resolved {
     /// Центр окна на холсте (Y вверх).
     pub position: Option<(f64, f64)>,
     pub size: Option<(i32, i32)>,
+    /// `None` — решает `[session]`.
+    pub suspend_on_close: Option<bool>,
+    pub restore_windows: Option<bool>,
 }
 
 pub(crate) fn compile(r: &RawRule, idx: usize) -> Result<(Rule, Vec<String>), String> {
@@ -156,6 +161,8 @@ pub(crate) fn compile(r: &RawRule, idx: usize) -> Result<(Rule, Vec<String>), St
             title: m(&r.title, "title")?,
             widget: r.widget,
             pinned_to_screen: r.pinned_to_screen,
+            suspend_on_close: r.suspend_on_close,
+            restore_windows: r.restore_windows,
             position: r.position.map(|[x, y]| (x, y)),
             size: r.size.map(|[w, h]| (w, h)),
         },
@@ -177,6 +184,12 @@ pub(crate) fn resolve(rules: &[Rule], exe: &str, class: &str, title: &str) -> Re
     for r in rules.iter().filter(|r| r.matches(exe, class, title)) {
         out.widget |= r.widget == Some(true);
         out.pinned_to_screen |= r.pinned_to_screen == Some(true);
+        if r.suspend_on_close.is_some() {
+            out.suspend_on_close = r.suspend_on_close;
+        }
+        if r.restore_windows.is_some() {
+            out.restore_windows = r.restore_windows;
+        }
         if r.position.is_some() {
             out.position = r.position;
         }

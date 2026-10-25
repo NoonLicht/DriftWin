@@ -52,6 +52,8 @@ pub enum Action {
     ZoomOut,
     /// Вернуть масштаб 1.0 в текущем положении камеры.
     ZoomReset,
+    /// Закрыть приложение, оставив на месте заглушку.
+    SuspendWindow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

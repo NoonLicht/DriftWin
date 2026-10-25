@@ -10,9 +10,11 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
-    HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
-    SetWindowRgn,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+    CreateCompatibleDC, DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS,
+    EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDIBits, GetMonitorInfoW, HDC, HMONITOR,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, ReleaseDC, SRCCOPY,
+    SelectObject, SetWindowRgn,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::*;
@@ -67,6 +69,9 @@ const EXCLUDE_CLASS: &[&str] = &[
     "Progman",
     "WorkerW",
 ];
+
+/// Класс окон-заглушек DriftWin (см. `dw-render`).
+pub const STUB_CLASS: &str = "DriftWinStub";
 
 pub fn hwnd_of(id: WindowId) -> HWND {
     HWND(id.0 as usize as *mut _)
@@ -179,7 +184,8 @@ unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> windows::core::BOOL {
             return true.into();
         }
         let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
-        if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
+        let is_stub = class_of(h) == STUB_CLASS;
+        if !is_stub && ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
             return true.into();
         }
         if GetWindow(h, GW_OWNER).is_ok_and(|o| !o.0.is_null()) {
@@ -205,6 +211,7 @@ unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> windows::core::BOOL {
         let (exe, elevated) = process_info(pid);
         let lexe = exe.to_lowercase();
         if let Some(only) = &ctx.filter.only
+            && !is_stub
             && !only.contains(&lexe)
         {
             return true.into();
@@ -220,7 +227,7 @@ unsafe extern "system" fn scan_cb(h: HWND, lp: LPARAM) -> windows::core::BOOL {
         if EXCLUDE_EXE.contains(&lexe.as_str()) || ctx.filter.exclude_exe.contains(&lexe) {
             return true.into();
         }
-        if elevated != Some(false) {
+        if !is_stub && elevated != Some(false) {
             skip("повышенные права (UIPI)");
             return true.into();
         }
@@ -740,5 +747,206 @@ pub fn init_dpi() {
     };
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Описание любого окна без отбора по фильтру (для собственных окон DriftWin).
+pub fn describe(id: WindowId) -> Option<Managed> {
+    let h = hwnd_of(id);
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() {
+            return None;
+        }
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    let (border, visible) = measure(h)?;
+    Some(Managed {
+        id,
+        pid,
+        exe: process_info(pid).0,
+        class: class_of(h),
+        title: title_of(h),
+        border,
+        visible,
+    })
+}
+
+/// Полный путь к exe процесса.
+pub fn image_path(pid: u32) -> Option<String> {
+    unsafe {
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut n = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n)
+            .is_ok();
+        let _ = CloseHandle(p);
+        ok.then(|| String::from_utf16_lossy(&buf[..n as usize]))
+    }
+}
+
+/// Командная строка процесса (`NtQueryInformationProcess(ProcessCommandLineInformation)`, Windows 8.1+).
+/// `None`, если доступа нет.
+pub fn command_line(pid: u32) -> Option<String> {
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    unsafe {
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        // UNICODE_STRING + сама строка в одном буфере
+        let mut buf = vec![0u8; 8192];
+        let mut ret = 0u32;
+        let st = NtQueryInformationProcess(
+            p,
+            PROCESSINFOCLASS(60),
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut ret,
+        );
+        let _ = CloseHandle(p);
+        if st.0 < 0 {
+            return None;
+        }
+        // struct UNICODE_STRING { u16 Length; u16 MaxLength; (pad) *u16 Buffer }
+        let len = u16::from_le_bytes([buf[0], buf[1]]) as usize / 2;
+        let ptr = usize::from_le_bytes(buf[8..16].try_into().ok()?) as *const u16;
+        let base = buf.as_ptr() as usize;
+        // буфер строки лежит внутри нашего массива сразу за структурой
+        if (ptr as usize) < base || (ptr as usize) + len * 2 > base + buf.len() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+            ptr, len,
+        )))
+    }
+}
+
+/// Запустить программу (`cmdline` — командная строка целиком, как у процесса; пусто — только путь).
+/// Возвращает pid.
+pub fn launch(path: &str, cmdline: &str) -> Result<u32> {
+    let app: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let mut cl: Vec<u16> = if cmdline.trim().is_empty() {
+        format!("\"{path}\"")
+    } else {
+        cmdline.to_string()
+    }
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let dir: Option<Vec<u16>> = std::path::Path::new(path).parent().map(|d| {
+        d.as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect()
+    });
+    let si = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            windows::core::PCWSTR(app.as_ptr()),
+            Some(PWSTR(cl.as_mut_ptr())),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            dir.as_ref().map_or(windows::core::PCWSTR::null(), |d| {
+                windows::core::PCWSTR(d.as_ptr())
+            }),
+            &si,
+            &mut pi,
+        )?;
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+    }
+    Ok(pi.dwProcessId)
+}
+
+/// Прозрачность окна: `Some(0.1..=1.0)` — установить, `None` — вернуть как было.
+/// Окна, у которых уже есть слой (`WS_EX_LAYERED`), не трогаем: их слоем управляет само приложение.
+/// Возвращает, поменялось ли окно.
+pub fn set_opacity(
+    id: WindowId,
+    value: Option<f64>,
+    we_set_layer: &mut bool,
+) -> Result<(), &'static str> {
+    let h = hwnd_of(id);
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() {
+            return Err("окна больше нет");
+        }
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        match value {
+            Some(v) => {
+                let layered = ex & WS_EX_LAYERED.0 as isize != 0;
+                if layered && !*we_set_layer {
+                    return Err("окно использует собственный слой (WS_EX_LAYERED)");
+                }
+                if !layered {
+                    SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+                    *we_set_layer = true;
+                }
+                let a = (v.clamp(0.1, 1.0) * 255.0).round() as u8;
+                SetLayeredWindowAttributes(h, windows::Win32::Foundation::COLORREF(0), a, LWA_ALPHA)
+                    .map_err(|_| "SetLayeredWindowAttributes отказал")
+            }
+            None => {
+                if *we_set_layer {
+                    SetWindowLongPtrW(h, GWL_EXSTYLE, ex & !(WS_EX_LAYERED.0 as isize));
+                    *we_set_layer = false;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Снимок прямоугольника экрана: RGBA-пиксели `w*h*4`.
+pub fn capture_rect(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    if w <= 0 || h <= 0 || i64::from(w) * i64::from(h) > 64_000_000 {
+        return None;
+    }
+    unsafe {
+        let sdc = GetDC(None);
+        let mdc = CreateCompatibleDC(Some(sdc));
+        let bmp = CreateCompatibleBitmap(sdc, w, h);
+        let old = SelectObject(mdc, bmp.into());
+        let blt = BitBlt(mdc, 0, 0, w, h, Some(sdc), x, y, SRCCOPY | CAPTUREBLT).is_ok();
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            mdc,
+            bmp,
+            0,
+            h as u32,
+            Some(px.as_mut_ptr().cast()),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+        SelectObject(mdc, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mdc);
+        ReleaseDC(None, sdc);
+        if !blt || lines == 0 {
+            return None;
+        }
+        for c in px.as_chunks_mut::<4>().0 {
+            c.swap(0, 2);
+            c[3] = 255;
+        }
+        Some(px)
     }
 }

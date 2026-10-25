@@ -6,12 +6,16 @@
 
 mod ghost;
 mod paint;
+mod stub;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub use ghost::{GhostItem, Ghosts};
+pub use stub::{
+    MIN_SIDE as STUB_MIN_SIDE, STUB_CLASS, create_stub, destroy_stub, set_stub_launching,
+};
 
 use dw_core::{Rect, Vec2};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -100,6 +104,10 @@ pub enum Event {
     Back,
     /// Клик по «призраку» окна у границы неуправляемого монитора.
     GhostClick(u64),
+    /// Клик или Enter на заглушке: запустить приложение.
+    StubLaunch(u64),
+    /// Кнопка закрытия заглушки: убрать её.
+    StubClose(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,4 +531,11 @@ impl Drop for Overlay {
             st.retain(|s| s.hwnd != self.hwnd.0 as isize);
         }
     }
+}
+
+/// Сохранить RGBA-снимок в PNG.
+pub fn save_png(path: &std::path::Path, w: u32, h: u32, rgba: Vec<u8>) -> Result<(), String> {
+    let img = image::RgbaImage::from_raw(w, h, rgba).ok_or("неверный размер снимка")?;
+    img.save_with_format(path, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())
 }

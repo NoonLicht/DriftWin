@@ -81,12 +81,11 @@
 - Исходный размер окна, которому менялся размер, сохраняется в `baseline.json` и возвращается при выходе.
 
 ## Принято, но пока не работает
-`autostart`; `[zoom]` (кроме `fit_padding`), `[decorations]`, `[effects]`, `[gestures]`, `[touch]`, `[outputs]`, `[session]`,
-`[background]`; в `[navigation]` — `trackpad_speed`, `touch_speed`, `drift`, `auto_navigate_on_*`, `nudge_step`,
+`autostart`; `[decorations]`, `[effects]`, `[gestures]`, `[touch]`, `[outputs]`; в `[navigation]` — `trackpad_speed`, `touch_speed`, `drift`, `auto_navigate_on_*`, `nudge_step`,
 `anchors`; `[outputs]` и горячие углы по мониторам; в `[windows]` — `elevated="notify"`, `park_limit`, `on_exit="bring_to_view"`,
-`disable_when_fullscreen`; в правилах — `fullscreen`, `focus_on_open`, `suspend_on_close`, `restore_windows`,
+`disable_when_fullscreen`; в правилах — `fullscreen`, `focus_on_open`,
 `preserve_aspect_ratio`, `decoration`, `blur`, `opacity`, `border_*`, `corner_radius`, `shadow`, `output`, `pass_keys`,
-`pass_mouse`, `layer_order`; действия `exec*`, `spawn`, зум (`zoom-*`, `zoom-to-fit*`), `suspend-window`, `move-to-bookmark`, `send-to-output` и др. (§2.12 плана).
+`pass_mouse`, `layer_order`; действия `exec*`, `spawn`, `move-to-bookmark`, `send-to-output` и др. (§2.12 плана).
 `toggle-fullscreen` растягивает окно на монитор, но стиль окна (рамку, заголовок) не меняет.
 Мышь: `[mouse.on-window]`/`on-canvas`, `resize_on_border`, `decoration_*`.
 Закреплённое окно пока не поднимается «поверх» остальных, а виджет не опускается «под» них.
@@ -168,3 +167,57 @@
 `[windows] max_fps = 0` (по умолчанию) — частота обновления самого быстрого из управляемых мониторов (на 180 Гц — 180 кадров/с).
 Кадры идут по таймеру высокого разрешения, скорость камеры не зависит от частоты кадров. Оверлей обзора не перерисовывается,
 если ничего не изменилось.
+
+## Этап 7: сессия, заглушки, IPC
+
+### `[session]`
+```toml
+[session]
+suspend_on_close  = false   # закрытие окна приложением оставляет заглушку
+restore_windows   = true    # открытые окна после перезапуска возвращаются заглушками
+restore_camera    = true
+restore_bookmarks = true    # закладки, поставленные клавишами (set-bookmark)
+```
+В `[[window_rules]]` те же поля `suspend_on_close` и `restore_windows` работают для отдельных приложений (последнее правило побеждает).
+
+### Заглушки
+`suspend-window` (по умолчанию `Win+Shift+Q`) просит окно в фокусе закрыться (`WM_CLOSE`, мягко; ждёт до 8 с, если приложение
+спросило «сохранить?»), а когда окно исчезло, ставит на его место и в его размер заглушку: имя приложения по центру и кнопка
+закрытия `×`. Клик или Enter — запустить приложение заново («запускается…»); новое окно, появившееся у запущенного процесса
+(сопоставление по pid до 30 с, запасной вариант — по имени exe до 5 с), занимает место и размер заглушки. Если окно не
+появилось за 30 с, заглушка снова «спит». Заглушку можно двигать, менять размер (не меньше 120×120), она участвует в
+привязке, кластерах, навигации и обзоре; в Alt-Tab и MRU не входит; закрепить/развернуть на весь экран её нельзя. `×` или
+`close-window` на заглушке просто убирает её.
+
+`suspend_on_close`: закрытие окна самим приложением превращается в заглушку. `close-window` и `driftwinctl msg close`
+заглушки не оставляют. Не различается закрытие кнопкой на панели задач (Windows шлёт то же `WM_CLOSE`).
+Запускается приложение по сохранённым пути к exe и командной строке (читается у процесса, `NtQueryInformationProcess`).
+Окна, которыми владеет другой процесс (UWP через `ApplicationFrameHost.exe`), закрываются без заглушки.
+
+### `session.json`
+`%LOCALAPPDATA%\DriftWin\session.json` (или `--state-dir`): версия формата, камера, закладки, окна и заглушки (приложение,
+заголовок, путь, командная строка, прямоугольник в мире). Пишется через ~1 с после изменения набора/положения окон и ~5 с
+после панорамирования; запись атомарная (временный файл + переименование). При старте камера и закладки читаются до
+сканирования; уже открытые окна с тем же приложением (сначала с тем же заголовком) возвращаются на сохранённые места, прочие
+записи становятся заглушками (само ничего не запускается). Повреждённый файл переименовывается в `session.json.corrupt.<время>`
+и старт идёт с пустой сессией; файл более новой версии обрабатывается так же. Формат v0 (без `version`) мигрируется.
+
+### IPC и `driftwinctl`
+Канал `\\.\pipe\driftwin-<SID пользователя>` (или `DRIFTWIN_PIPE`): DACL только текущему пользователю, сетевые клиенты
+отклоняются, первый экземпляр создаётся с `FILE_FLAG_FIRST_PIPE_INSTANCE`. Однострочный JSON, запрос → ответ
+`{"Ok":…}` / `{"Err":"…"}`. Селектор окна: число — `id` (HWND), строка — подстрока имени exe без учёта регистра
+(в приоритете окно в фокусе).
+```
+driftwinctl [--json] msg camera X Y [--relative] | zoom L | focus W | move W X Y [--relative] | resize W w h
+                          | opacity W v | pin W | close W | suspend W | relaunch W | layout | cursor [X Y]
+                          | action "<действие>" | bookmark N [--set] | screenshot файл.png | state | subscribe
+                          | debug-counters
+```
+`subscribe` печатает снимок состояния при каждом изменении, не чаще 30 раз в секунду. `[ipc] expose_titles = false` убирает
+заголовки окон из ответов. Ограничения: `layout` не поддерживается (ответ-ошибка); `opacity` не трогает окна с собственным слоем
+(`WS_EX_LAYERED`) и возвращается при выходе; `screenshot` снимает экран управляемых мониторов (как есть, вместе с оверлеями);
+`quit`/`exec` через IPC отдельно не ограничиваются — канал доступен лишь тому же пользователю.
+
+### `state.txt`
+`key=value` примерно 10 раз в секунду (только при изменении): `camera_x`, `camera_y`, `zoom`, `windows`, `suspended`, `focused`,
+`focused_app`, `active_bookmark`, `paused`.

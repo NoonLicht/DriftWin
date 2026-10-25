@@ -3,6 +3,7 @@
 pub mod action;
 pub mod canvas;
 pub mod nav;
+pub mod session;
 pub mod snap;
 
 use std::ops::{Add, Mul, Sub};

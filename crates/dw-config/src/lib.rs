@@ -129,8 +129,28 @@ pub struct Monitors {
     pub isolate: bool,
 }
 
+/// Сессия и заглушки (`[session]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    /// Закрытие окна клиентом превращается в заглушку.
+    pub suspend_on_close: bool,
+    /// Открытые окна возвращаются после перезапуска заглушками.
+    pub restore_windows: bool,
+    pub restore_camera: bool,
+    pub restore_bookmarks: bool,
+}
+
+/// Настройки IPC (`[ipc]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ipc {
+    /// Показывать заголовки окон в ответах и подписке.
+    pub expose_titles: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub session: Session,
+    pub ipc: Ipc,
     pub monitors: Monitors,
     pub zoom: Zoom,
     pub background: Background,
@@ -194,7 +214,23 @@ struct RawConfig {
     gestures: Option<toml::Value>,
     touch: Option<toml::Value>,
     outputs: Option<toml::Value>,
-    session: Option<toml::Value>,
+    session: RawSession,
+    ipc: RawIpc,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawSession {
+    suspend_on_close: Option<bool>,
+    restore_windows: Option<bool>,
+    restore_camera: Option<bool>,
+    restore_bookmarks: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawIpc {
+    expose_titles: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -341,7 +377,6 @@ const UNSUPPORTED_ACTIONS: &[&str] = &[
     "exec-terminal",
     "exec-launcher",
     "spawn",
-    "suspend-window",
     "move-to-bookmark",
     "set-trackpad",
     "send-to-output",
@@ -363,6 +398,15 @@ fn parse_dir(s: Option<&str>) -> Result<Dir, String> {
         .find(|(n, _)| *n == s)
         .map(|(_, d)| *d)
         .ok_or_else(|| format!("неизвестное направление «{s}» (up, down, left, right)"))
+}
+
+/// Разобрать действие из строки (как значение в `[keybindings]`), например для IPC.
+pub fn parse_action_str(src: &str) -> Result<Action, String> {
+    match parse_action(src)? {
+        ParsedAction::Action(a) => Ok(a),
+        ParsedAction::None => Err("«none» — не действие".into()),
+        ParsedAction::Unsupported(n) => Err(format!("действие «{n}» пока не поддерживается")),
+    }
 }
 
 fn parse_action(src: &str) -> Result<ParsedAction, String> {
@@ -417,6 +461,7 @@ fn parse_action(src: &str) -> Result<ParsedAction, String> {
         "zoom-in" => Action::ZoomIn,
         "zoom-out" => Action::ZoomOut,
         "zoom-reset" => Action::ZoomReset,
+        "suspend-window" => Action::SuspendWindow,
         n if UNSUPPORTED_ACTIONS.contains(&n) => return Ok(ParsedAction::Unsupported(n.into())),
         n => return Err(format!("неизвестное действие «{n}»")),
     };
@@ -457,6 +502,7 @@ fn default_keybindings(m: ModKey) -> Vec<(String, String)> {
     v.push(("mod+ctrl+equals".into(), "zoom-in".into()));
     v.push(("mod+ctrl+minus".into(), "zoom-out".into()));
     v.push(("mod+ctrl+0".into(), "zoom-reset".into()));
+    v.push((format!("{letter}+shift+q"), "suspend-window".into()));
     v.push((format!("{letter}+rbracket"), "snap-gap-increase".into()));
     v.push((format!("{letter}+lbracket"), "snap-gap-decrease".into()));
     if m == ModKey::Super {
@@ -882,7 +928,6 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
         ("gestures", raw.gestures.is_some()),
         ("touch", raw.touch.is_some()),
         ("outputs", raw.outputs.is_some()),
-        ("session", raw.session.is_some()),
     ] {
         if set {
             cx.warn_at(name, format!("секция [{name}] пока не поддерживается"));
@@ -964,6 +1009,15 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             .filter(|n| !n.is_empty())
             .collect(),
         isolate: raw.monitors.isolate.unwrap_or(true),
+    };
+    let session = Session {
+        suspend_on_close: raw.session.suspend_on_close.unwrap_or(false),
+        restore_windows: raw.session.restore_windows.unwrap_or(true),
+        restore_camera: raw.session.restore_camera.unwrap_or(true),
+        restore_bookmarks: raw.session.restore_bookmarks.unwrap_or(true),
+    };
+    let ipc = Ipc {
+        expose_titles: raw.ipc.expose_titles.unwrap_or(true),
     };
     let hc = &raw.hot_corners;
     let corner = |v: &Option<String>, name: &str, cx: &mut Ctx| -> Option<Action> {
@@ -1062,6 +1116,8 @@ pub fn parse(src: &str) -> Result<Loaded, Vec<ConfigError>> {
             zoom,
             background,
             monitors,
+            session,
+            ipc,
         },
         warnings: cx.warnings,
     })
@@ -1477,5 +1533,55 @@ pinned_to_screen = true
             .unwrap()
             .config;
         assert_eq!(c.navigation.bookmarks.get(&2), Some(&(100.0, -50.0)));
+    }
+
+    #[test]
+    fn session_ipc_and_suspend_rules() {
+        let d = parse("").unwrap();
+        assert!(d.warnings.is_empty());
+        let c = d.config;
+        assert_eq!(
+            c.session,
+            Session {
+                suspend_on_close: false,
+                restore_windows: true,
+                restore_camera: true,
+                restore_bookmarks: true
+            }
+        );
+        assert!(c.ipc.expose_titles);
+        assert!(
+            c.bindings
+                .keys
+                .iter()
+                .any(|k| k.action == Action::SuspendWindow)
+        );
+        let l = parse(
+            "[session]
+suspend_on_close = true
+restore_windows = false
+[ipc]
+expose_titles = false
+             [[window_rules]]
+app_id = \"notepad.exe\"
+suspend_on_close = false
+             [[window_rules]]
+app_id = \"*\"
+restore_windows = true
+",
+        )
+        .unwrap();
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(l.config.session.suspend_on_close && !l.config.session.restore_windows);
+        assert!(!l.config.ipc.expose_titles);
+        let r = l.config.resolve("notepad.exe", "", "");
+        assert_eq!(r.suspend_on_close, Some(false));
+        assert_eq!(r.restore_windows, Some(true));
+        assert_eq!(l.config.resolve("a.exe", "", "").suspend_on_close, None);
+        assert_eq!(
+            parse_action_str("suspend-window"),
+            Ok(Action::SuspendWindow)
+        );
+        assert!(parse_action_str("spawn x").is_err());
     }
 }

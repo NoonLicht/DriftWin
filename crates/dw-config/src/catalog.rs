@@ -86,6 +86,8 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("monitors", "Мониторы"),
     ("background", "Фон"),
     ("hot_corners", "Горячие углы"),
+    ("session", "Сессия и заглушки"),
+    ("ipc", "IPC"),
 ];
 
 pub const SETTINGS: &[Setting] = &[
@@ -306,6 +308,46 @@ pub const SETTINGS: &[Setting] = &[
         "Окна не заходят на неотмеченные мониторы: пока окно перекрывает такой монитор, оно спрятано.",
     ),
     s(
+        "session",
+        "suspend_on_close",
+        Kind::Bool,
+        Def::Bool(false),
+        "Закрытие окна оставляет заглушку",
+        "Когда приложение закрывает своё окно, на его месте остаётся заглушка. Не относится к close-window.",
+    ),
+    s(
+        "session",
+        "restore_windows",
+        Kind::Bool,
+        Def::Bool(true),
+        "Восстанавливать окна",
+        "После перезапуска открытые окна возвращаются заглушками (сами приложения не запускаются).",
+    ),
+    s(
+        "session",
+        "restore_camera",
+        Kind::Bool,
+        Def::Bool(true),
+        "Восстанавливать положение камеры",
+        "Камера встаёт туда, где была при выходе.",
+    ),
+    s(
+        "session",
+        "restore_bookmarks",
+        Kind::Bool,
+        Def::Bool(true),
+        "Восстанавливать закладки",
+        "Закладки, поставленные клавишами, сохраняются между запусками.",
+    ),
+    s(
+        "ipc",
+        "expose_titles",
+        Kind::Bool,
+        Def::Bool(true),
+        "Показывать заголовки окон в IPC",
+        "Если выключено, driftwinctl и подписчики не видят заголовки окон.",
+    ),
+    s(
         "zoom",
         "min",
         f(0.02, 0.9),
@@ -485,6 +527,11 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("zoom-in", Arg::None, "Приблизить"),
     a("zoom-out", Arg::None, "Отдалить"),
     a("zoom-reset", Arg::None, "Масштаб 1:1"),
+    a(
+        "suspend-window",
+        Arg::None,
+        "Закрыть приложение, оставив заглушку",
+    ),
     a("snap-gap-increase", Arg::None, "Зазор больше"),
     a("snap-gap-decrease", Arg::None, "Зазор меньше"),
 ];
