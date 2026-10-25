@@ -728,6 +728,7 @@ impl App {
             ShotTarget::All => rect(dw_win::virtual_screen()),
             ShotTarget::Output(n) => rect(self.find_output(n)?.rect),
             ShotTarget::Region { x, y, w, h } => rect((*x, *y, *w, *h)),
+            ShotTarget::Canvas { scale } => self.canvas_shot(*scale),
             ShotTarget::Window(sel) => {
                 let id = self.find_window(sel)?;
                 if let Some(shot) = dw_win::capture_window(id) {
@@ -774,6 +775,38 @@ impl App {
             };
             let _ = reply.send(resp);
         });
+    }
+
+    /// Весь холст: окна снимаются по одному и ставятся на картинку по мировым координатам.
+    fn canvas_shot(&self, scale: f64) -> Result<(Vec<u8>, i32, i32), String> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err("scale должен быть положительным числом".into());
+        }
+        let fg = dw_win::foreground();
+        let mut ids: Vec<WindowId> = self
+            .managed
+            .keys()
+            .filter(|id| self.canvas.contains(**id) && !self.canvas.is_pinned(**id))
+            .copied()
+            .collect();
+        // окно в фокусе — сверху
+        ids.sort_by_key(|id| (Some(*id) == fg, id.0));
+        let pieces: Vec<crate::shot::Piece> = ids
+            .iter()
+            .filter_map(|id| {
+                let r = self.canvas.rect(*id)?;
+                let (px, w, h) = dw_win::capture_window(*id)?;
+                Some(crate::shot::Piece {
+                    x: r.center.x - r.w / 2.0,
+                    y: -(r.center.y + r.h / 2.0),
+                    w,
+                    h,
+                    px,
+                })
+            })
+            .collect();
+        crate::shot::compose(&pieces, self.cfg.background.color, scale)
+            .ok_or_else(|| "на холсте нет окон, которые удалось снять".to_string())
     }
 
     fn bookmark_at_camera(&self) -> Option<u8> {

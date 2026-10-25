@@ -101,6 +101,12 @@ enum Msg {
         /// Область экрана: X Y ширина высота.
         #[arg(long, num_args = 4, allow_negative_numbers = true, value_names = ["X", "Y", "W", "H"])]
         region: Option<Vec<i32>>,
+        /// Весь холст: все окна по своим местам, включая те, что далеко за экраном.
+        #[arg(long, conflicts_with_all = ["all", "output", "window", "region"])]
+        canvas: bool,
+        /// Масштаб для --canvas (0.01..1, по умолчанию 1).
+        #[arg(long, requires = "canvas", default_value_t = 1.0)]
+        scale: f64,
     },
     /// Состояние: камера, окна, мониторы.
     State,
@@ -163,9 +169,13 @@ fn request(m: Msg) -> Result<Request, String> {
             output,
             window,
             region,
+            canvas,
+            scale,
         } => Request::Screenshot {
             path,
-            target: if all {
+            target: if canvas {
+                ShotTarget::Canvas { scale }
+            } else if all {
                 ShotTarget::All
             } else if let Some(o) = output {
                 ShotTarget::Output(o)

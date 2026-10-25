@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod deco;
 mod onboarding;
+mod shot;
 mod suspend;
 
 /// Через сколько без нажатий переключатель MRU фиксирует выбор.
