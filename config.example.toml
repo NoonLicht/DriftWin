@@ -45,6 +45,13 @@ centers = false              # выравнивать центры
 use = []                     # например ["DISPLAY2", "DISPLAY3"]
 isolate = true               # окна не заходят на остальные мониторы (прячутся, пока перекрывают их)
 
+# Оформление окон через DWM (Windows 11). keep — не менять; те же ключи работают в [[window_rules]].
+[decorations]
+corner = "keep"              # keep | default | square | round | small
+border_color = "keep"        # #rrggbb | none | keep
+backdrop = "keep"            # keep | none | mica | acrylic | tabbed (виден только у части приложений)
+opacity = 1.0                # 0.1..1.0
+
 # Сессия и заглушки (suspend-window, Win+Shift+Q). Файл сессии: %LOCALAPPDATA%\DriftWin\session.json
 [session]
 suspend_on_close = false     # закрытие окна приложением оставляет заглушку на его месте
